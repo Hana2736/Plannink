@@ -1,0 +1,32 @@
+{
+    "gpu_settings": {
+        "HSA_OVERRIDE_GFX_VERSION": "11.0.0"
+    },
+    "paths": {
+        "train_data": "TrainData",
+        "flat_data": "TrainData_Flat",
+        "models": "Models",
+        "shm_state": "/dev/shm/spl3ai_state.txt"
+    },
+    "model_name": "spl3_everything_balanced.pkl",
+    "switch": {
+        "ip": "192.168.1.XXX",
+        "sysbot_port": 6000,
+        "ftp_port": 5000,
+        "ftp_user": "hana",
+        "ftp_pass": "password1234"
+    },
+    "server": {
+        "control_port": 5002,
+        "api_port": 5003,
+        "control_host": "127.0.0.1",
+        "api_bind": "0.0.0.0"
+    },
+    "switch_paths": {
+        "replay_dir": "/atmosphere/saves/sysmmc/user/cache/0100c2500fc20000/00000000000000000000000000000000/0/replay/"
+    },
+    "api_secret": "YOUR_SUPER_SECRET_TOKEN_HERE",
+    "capture": {
+        "device_name": "UGREEN"
+    }
+}
