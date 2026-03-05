@@ -1,0 +1,66 @@
+{
+    "ClickA": [
+        "click A"
+    ],
+    "ClickB": [
+        "click B"
+    ],
+    "ClickX": [
+        "click X"
+    ],
+    "ClickY": [
+        "click Y"
+    ],
+    "ClickZLZR": [
+        "press ZL",
+        "press ZR",
+        "sleep 0.5",
+        "release ZL",
+        "release ZR"
+    ],
+    "ClickDpadRight": [
+        "click DRIGHT"
+    ],
+    "ClickDpadLeft": [
+        "click DLEFT"
+    ],
+    "ClickDpadUp": [
+        "click DUP"
+    ],
+    "ClickDpadDown": [
+        "click DDOWN"
+    ],
+    "ClickPlus": [
+        "click PLUS"
+    ],
+    "BackspaceAll": [
+        "key 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42"
+    ],
+    "QuitGame": [
+        "sleep 1",
+        "click HOME",
+        "sleep 1",
+        "click X",
+        "sleep 0.75",
+        "click A"
+    ],
+    "WalkToLobbyTml": [
+        "setStick LEFT -0x300 0x7FFF",
+        "sleep 3.5",
+        "setStick LEFT 0x0 0x0",
+        "sleep 0.1",
+        "setStick LEFT -0x6000 0x200",
+        "sleep 0.75",
+        "setStick LEFT 0x0 0x0",
+        "sleep 0.1",
+        "setStick LEFT -0x300 0x7FFF",
+        "sleep 0.7",
+        "setStick LEFT 0x0 0x0"
+    ],
+    "screenOff": [
+        "screenOff"
+    ],
+    "screenOn": [
+        "screenOn"
+    ]
+}

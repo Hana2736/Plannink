@@ -1,0 +1,35 @@
+# Config
+config.json
+
+# Models and weights
+Models/*.pkl
+!Models/spl3_everything_balanced.pkl
+Tools/models/
+*.pth
+
+# Data
+TrainData_Flat/
+Temp_Train/
+TrainData/
+TrainData.zip
+!TrainData.zip.*
+
+# Environment
+env/
+Tools/byml-v2/
+Tools/byml-v2-2.4.5/
+Tools/v2.4.5.tar.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs and outputs
+Tools/ai_output.txt
+
+# OS
+.DS_Store
+*.swp
+.*.swp
+.API.md.kate-swp
