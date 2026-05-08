@@ -308,7 +308,7 @@ def inference_thread(model_path):
         latest_confidence = float(conf.item() * 100)
 
         frame_elapsed = time.time() - frame_start
-        ai_fps = 1.0 / frame_elapsed if frame_elapsed > 0 else 0
+        infer_fps = 1.0 / frame_elapsed if frame_elapsed > 0 else 0  # raw inference capability
 
         state_str = f"{latest_prediction} ({latest_confidence:.1f}%)"
         try:
@@ -317,13 +317,6 @@ def inference_thread(model_path):
         except Exception:
             pass
 
-        # Log current state once per second so docker logs shows what the AI sees
-        now = time.time()
-        if now - last_log_time >= 1.0:
-            mode = 'idle' if os.path.exists(IDLE_MARKER_PATH) else 'active'
-            print(f"👁  {state_str} @ {ai_fps:.1f}fps [{mode}]", flush=True)
-            last_log_time = now
-
         # --- FPS throttle ---
         # Pick the target interval based on the idle marker that
         # state_machine maintains: full TARGET_FPS when there's work
@@ -331,16 +324,24 @@ def inference_thread(model_path):
         # and IDLE_TARGET_FPS when parked at CodeBoxSelected with nothing
         # to do. The marker is just a sentinel file — cheap to stat each
         # frame and lets the state machine flip the rate without IPC.
-        if os.path.exists(IDLE_MARKER_PATH):
-            target_interval = 1.0 / IDLE_TARGET_FPS
-        else:
-            target_interval = TARGET_INTERVAL
+        idle = os.path.exists(IDLE_MARKER_PATH)
+        target_interval = (1.0 / IDLE_TARGET_FPS) if idle else TARGET_INTERVAL
         sleep_time = target_interval - frame_elapsed
         if sleep_time > 0:
             time.sleep(sleep_time)
-        # Update ai_fps to reflect the full frame time including sleep
         total_frame = time.time() - frame_start
-        ai_fps = 1.0 / total_frame if total_frame > 0 else 0
+        ai_fps = 1.0 / total_frame if total_frame > 0 else 0  # actual achieved rate after throttle
+
+        # Log current state once per second. Logged AFTER the throttle so
+        # ai_fps reflects the achieved rate, not the pre-throttle inference
+        # rate — at idle this means we'll see "@ 0.5fps [idle]" and only
+        # one log line per 2 seconds, which is exactly what we want to
+        # confirm the idle throttle is biting.
+        now = time.time()
+        if now - last_log_time >= 1.0:
+            mode = 'idle' if idle else 'active'
+            print(f"👁  {state_str} @ {ai_fps:.1f}fps [{mode}, infer {infer_fps:.1f}fps]", flush=True)
+            last_log_time = now
 
 
 def find_and_configure_capture_device():
