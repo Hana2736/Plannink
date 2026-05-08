@@ -1,4 +1,18 @@
 import os
+
+# Cap CPU thread fan-out BEFORE importing numerical libs.
+# PyTorch's CPU backend defaults to one OpenMP thread per physical core
+# (8 on the i7-10700 deployment box), which means each model.forward()
+# burns all cores for ~100ms. At 8 fps active / 0.5 fps idle that's
+# massive overshoot — 2 threads is plenty and slashes the CPU footprint
+# by ~75%. These env vars must be set before torch / cv2 / numpy are
+# imported, since libtorch / OpenCV's OpenMP / OpenBLAS read them at
+# library init time.
+INFERENCE_NUM_THREADS = 2
+os.environ.setdefault('OMP_NUM_THREADS', str(INFERENCE_NUM_THREADS))
+os.environ.setdefault('MKL_NUM_THREADS', str(INFERENCE_NUM_THREADS))
+os.environ.setdefault('OPENBLAS_NUM_THREADS', str(INFERENCE_NUM_THREADS))
+
 import signal
 import time
 import cv2
@@ -9,6 +23,13 @@ import re
 import sys
 import threading
 import torch
+
+# Belt-and-suspenders: the env vars above tell libtorch's OpenMP runtime
+# how many threads to spawn, but explicitly setting via the Python API
+# pins the values inside this process even if env happens to be unset.
+torch.set_num_threads(INFERENCE_NUM_THREADS)
+torch.set_num_interop_threads(1)
+
 from datetime import datetime
 from pathlib import Path
 from fastai.vision.all import *
@@ -174,7 +195,7 @@ def inference_thread(model_path):
     """
     global latest_prediction, latest_confidence, all_probs, ai_fps, running
 
-    print(f"🧠 Loading Model (device={'GPU/FP16' if USE_GPU else 'CPU/INT8'}, target={TARGET_FPS} fps)...")
+    print(f"🧠 Loading Model (device={'GPU/FP16' if USE_GPU else 'CPU/INT8'}, target={TARGET_FPS} fps active / {IDLE_TARGET_FPS} fps idle, threads={INFERENCE_NUM_THREADS})...")
 
     # ------------------------------------------------------------------ #
     # plum-dispatch 1.x compat shim                                       #
@@ -299,7 +320,8 @@ def inference_thread(model_path):
         # Log current state once per second so docker logs shows what the AI sees
         now = time.time()
         if now - last_log_time >= 1.0:
-            print(f"👁  {state_str} @ {ai_fps:.1f}fps", flush=True)
+            mode = 'idle' if os.path.exists(IDLE_MARKER_PATH) else 'active'
+            print(f"👁  {state_str} @ {ai_fps:.1f}fps [{mode}]", flush=True)
             last_log_time = now
 
         # --- FPS throttle ---

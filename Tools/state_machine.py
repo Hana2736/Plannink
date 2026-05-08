@@ -40,6 +40,11 @@ RESTART_HOURS = 6      # hours before forced restart
 API_PORT = config.get('server', {}).get('api_port', 5003)
 API_SECRET = config['api_secret']
 
+# Mirror the inference rates run_vision_ai.py uses, so /status can report
+# the right number to the GUI without a second source of truth.
+INFERENCE_TARGET_FPS = config.get('inference', {}).get('target_fps', 8)
+INFERENCE_IDLE_FPS = 0.5
+
 # Latest capture-card snapshot, written by run_vision_ai for the manual GUI.
 FRAME_JPEG_PATH = '/dev/shm/frame.jpg'
 
@@ -199,7 +204,8 @@ html, body { margin: 0; padding: 0; background: #111; color: #ddd; font-family: 
 .frame img { width: 100%; height: 100%; object-fit: contain; }
 body.paused .frame { border-color: #c33; }
 #status { text-align: center; font-size: 12px; color: #888; padding: 6px; min-height: 1em; }
-#pausebar { display: flex; justify-content: center; padding: 6px 12px; max-width: 720px; margin: 0 auto; }
+#pausebar { display: flex; flex-direction: column; align-items: center; padding: 6px 12px; max-width: 720px; margin: 0 auto; gap: 4px; }
+#ai-status { font-size: 12px; color: #888; min-height: 1em; font-family: ui-monospace, Menlo, Consolas, monospace; }
 #pause-btn { width: 100%; max-width: 360px; padding: 14px; font-size: 17px; font-weight: 600; border-radius: 10px; border: 1px solid #555; background: #2a2a2a; color: #ddd; cursor: pointer; }
 #pause-btn:active { background: #4a4a4a; }
 body.paused #pause-btn { background: #2a5a2a; border-color: #5c5; color: #cfc; }
@@ -242,7 +248,10 @@ button.shoulder { width: 76px; }
 </head>
 <body>
 <div class="frame"><img id="frame" alt="capture (loading...)" /></div>
-<div id="pausebar"><button id="pause-btn">⏸ PAUSE BOT</button></div>
+<div id="pausebar">
+  <button id="pause-btn">⏸ PAUSE BOT</button>
+  <div id="ai-status">AI: …</div>
+</div>
 <div id="status">connecting…</div>
 
 <div class="pad">
@@ -325,21 +334,37 @@ document.querySelectorAll('button[data-cmd]').forEach(btn => {
   btn.addEventListener('click', () => send(btn.dataset.cmd));
 });
 
-// Pause toggle. Posts to /pause; periodic GET /pause keeps the button in
-// sync if multiple browsers are open or if pause was toggled elsewhere.
+// Pause toggle + AI status display.
+// Periodic GET /status keeps the pause button + "AI: Nfps mode" line in
+// sync if pause was toggled elsewhere or the bot transitioned between
+// idle and active. The button still POSTs to /pause for toggling.
 const pauseBtn = document.getElementById('pause-btn');
+const aiStatusEl = document.getElementById('ai-status');
 let isPaused = false;
 function applyPauseState(paused) {
   isPaused = paused;
   document.body.classList.toggle('paused', paused);
   pauseBtn.textContent = paused ? '▶ RESUME BOT' : '⏸ PAUSE BOT';
 }
-async function refreshPause() {
+function applyAiStatus(s) {
+  if (s.paused) {
+    aiStatusEl.textContent = 'AI: paused';
+    aiStatusEl.style.color = '#fc6';
+  } else if (s.idle) {
+    aiStatusEl.textContent = 'AI: ' + s.idle_fps + 'fps idle';
+    aiStatusEl.style.color = '#888';
+  } else {
+    aiStatusEl.textContent = 'AI: ' + s.target_fps + 'fps active';
+    aiStatusEl.style.color = '#6c6';
+  }
+}
+async function refreshStatus() {
   try {
-    const r = await fetch('/pause?token=' + encodeURIComponent(token));
+    const r = await fetch('/status?token=' + encodeURIComponent(token));
     if (r.ok) {
-      const txt = (await r.text()).trim();
-      applyPauseState(txt === 'on');
+      const s = await r.json();
+      applyPauseState(!!s.paused);
+      applyAiStatus(s);
     }
   } catch (e) { /* ignore — next poll will retry */ }
 }
@@ -356,17 +381,18 @@ pauseBtn.addEventListener('click', async () => {
       const txt = (await r.text()).trim();
       applyPauseState(txt === 'on');
       setStatus(txt === 'on' ? 'PAUSED' : 'RESUMED', txt === 'on' ? '#fc6' : '#6c6');
+      refreshStatus();  // pick up the new idle/active reading immediately
     } else {
       setStatus('PAUSE HTTP ' + r.status, '#e66');
-      refreshPause();  // resync from server
+      refreshStatus();  // resync from server
     }
   } catch (e) {
     setStatus('PAUSE NET: ' + e.message, '#e66');
-    refreshPause();
+    refreshStatus();
   }
 });
-refreshPause();
-setInterval(refreshPause, 3000);
+refreshStatus();
+setInterval(refreshStatus, 3000);
 
 // Frame poll. Kept at 15 fps to match what vision writes to /dev/shm/frame.jpg
 // — polling faster just rereads the same JPEG and wastes bandwidth.
@@ -456,6 +482,10 @@ class ReplayCodeHandler(BaseHTTPRequestHandler):
             if not self._auth_ok():
                 return
             return self._send_text(200, b'on' if _paused.is_set() else b'off')
+        if path == '/status':
+            if not self._auth_ok():
+                return
+            return self._handle_status()
         self._send_text(404, b'Not found')
 
     def do_POST(self):
@@ -603,6 +633,21 @@ class ReplayCodeHandler(BaseHTTPRequestHandler):
             log.warning("RESUME requested via API")
             return self._send_text(200, b'off')
         self._send_text(400, b'Body must be "on" or "off"')
+
+    def _handle_status(self):
+        """Return current paused / idle / FPS state as JSON for the GUI poll."""
+        body = json.dumps({
+            'paused': _paused.is_set(),
+            'idle': os.path.exists(IDLE_MARKER_PATH),
+            'target_fps': INFERENCE_TARGET_FPS,
+            'idle_fps': INFERENCE_IDLE_FPS,
+        }).encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_control_page(self):
         body = CONTROL_PAGE_HTML.encode('utf-8')
