@@ -1,0 +1,23 @@
+# Dev environment
+env/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Training data — large, not needed at runtime
+TrainData/
+TrainData_Flat/
+TrainData.zip.*
+
+# Git history
+.git/
+
+# Local config (mounted as a volume at runtime instead)
+config.json
+
+# IDE / OS noise
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db

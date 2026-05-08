@@ -1,0 +1,31 @@
+# Plannink — single-container deployment for TrueNAS SCALE (or any Docker host)
+#
+# All three services (vision, control, statemachine) run inside one container
+# managed by supervisord.  Intra-process comms use 127.0.0.1 sockets and
+# /dev/shm exactly as they do when running manually — no extra config needed.
+#
+# Prerequisites:
+#   1. Copy config.json.example → config.json and fill in your Switch IP,
+#      FTP credentials, and API secret.
+#   2. Check which /dev/videoX nodes your capture card claims on the host:
+#        v4l2-ctl --list-devices
+#      Then adjust the `devices:` list below to match.
+#   3. Run:  docker compose up -d
+
+services:
+  plannink:
+    image: hana2736/plannink:latest
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./Models:/app/Models:ro
+    devices:
+      # Adjust to whichever /dev/videoX your capture card claims on the host.
+      # Both nodes are passed through so the v4l2 scanner inside the container
+      # can find the right one automatically.
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+    # host networking lets the container reach your Switch (and capture card)
+    # on the LAN directly. Port 5003 is automatically available on the host
+    # without any explicit mapping.
+    network_mode: host
+    restart: unless-stopped
