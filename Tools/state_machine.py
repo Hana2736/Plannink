@@ -221,6 +221,8 @@ button.face.b { background: #5a4a1a; } button.face.b:active { background: #aa8a2
 button.face.x { background: #1a3a5a; } button.face.x:active { background: #2a6aaa; }
 button.face.y { background: #1a5a3a; } button.face.y:active { background: #2aaa6a; }
 button.shoulder { width: 76px; }
+button.combo { width: auto; min-width: 140px; background: #2a3a55; border-color: #4a6a8a; }
+button.combo:active { background: #3a5575; }
 .dpad { display: grid; grid-template-columns: 56px 56px 56px; grid-template-rows: 56px 56px 56px; gap: 4px; }
 .dpad button { padding: 0; min-width: 0; font-size: 22px; }
 .dpad .up    { grid-column: 2; grid-row: 1; }
@@ -264,6 +266,10 @@ button.shoulder { width: 76px; }
       <button class="shoulder" data-cmd="click ZR">ZR</button>
       <button class="shoulder" data-cmd="click R">R</button>
     </div>
+  </div>
+
+  <div class="row">
+    <button class="shoulder combo" data-cmd="ClickZLZR">ZL + ZR</button>
   </div>
 
   <div class="row spread">
@@ -607,7 +613,21 @@ class ReplayCodeHandler(BaseHTTPRequestHandler):
             return self._send_text(400, b'Invalid command')
         # Manual presses change Switch state; vision needs full FPS to track.
         _clear_idle()
-        send_raw(body)
+        # Dispatch by case convention:
+        #   lowercase first char ("click A", "setStick LEFT 0 0") → sysbot
+        #     raw passthrough — used for individual button taps and stick
+        #     deflections that don't need an actions.json entry.
+        #   uppercase first char ("ClickZLZR", "QuitGame")        → named
+        #     action lookup in actions.json — used for multi-step macros
+        #     like the simultaneous-hold ZL+ZR combo the title screen needs.
+        # Both paths go through _send_to_backend directly (not send_action)
+        # so manual GUI inputs stay exempt from the pause flag — the whole
+        # point of pause is that you can drive manually without the bot
+        # fighting back.
+        if body[0].islower():
+            _send_to_backend(f"raw {body}", f"raw {body}")
+        else:
+            _send_to_backend(body, body)
         self._send_text(200, b'OK')
 
     def _handle_pause(self):
