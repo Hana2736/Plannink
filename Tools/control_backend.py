@@ -1,5 +1,7 @@
 import socket
 import json
+import signal
+import sys
 import time
 from pathlib import Path
 import os
@@ -13,6 +15,33 @@ SWITCH_IP = config['switch']['ip']
 SWITCH_PORT = config['switch']['sysbot_port']
 CONTROL_PORT = config.get('server', {}).get('control_port', 5002)
 CONTROL_HOST = config.get('server', {}).get('control_host', '127.0.0.1')
+
+
+def _exit_stack(reason):
+    """Reboot the entire supervised stack via supervisord SIGTERM.
+
+    Called when the sysbot socket to the Switch dies — at that point the
+    state machine's assumptions about Switch state are invalid, so the
+    only safe recovery is to bring all three programs (vision, control,
+    statemachine) back up from a fresh supervisord launch (which in turn
+    triggers a docker restart of the container).
+    """
+    print(f"❌ FATAL: {reason} — rebooting stack", flush=True)
+    try:
+        with open('/tmp/supervisord.pid') as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (FileNotFoundError, ProcessLookupError, ValueError, PermissionError, OSError):
+        pass
+    sys.exit(1)
+
+
+def _switch_send(switch_sock, payload):
+    """sendall(payload) to the Switch sysbot, rebooting on any socket error."""
+    try:
+        switch_sock.sendall(payload)
+    except Exception as e:
+        _exit_stack(f"sysbot socket write failed: {e}")
 
 # HID Keyboard Mapping
 KEY_MAP = {}
@@ -33,7 +62,7 @@ def send_fix_controls(switch_sock):
     print("🛠️  Running Fix Controls sequence...")
     for cmd in FIX_CONTROLS_CMDS:
         print(f"  ➡️ {cmd}")
-        switch_sock.sendall(f"{cmd}\n".encode('ascii'))
+        _switch_send(switch_sock, f"{cmd}\n".encode('ascii'))
 
 def type_string(s, switch_sock):
     """Helper to type a whole string of characters in a single key command."""
@@ -47,21 +76,27 @@ def type_string(s, switch_sock):
     if codes:
         cmd = f"key {' '.join(codes)}"
         print(f"  ➡️ {cmd}")
-        switch_sock.sendall(f"{cmd}\n".encode('ascii'))
+        _switch_send(switch_sock, f"{cmd}\n".encode('ascii'))
 
 def run_control_backend():
+    try:
+        with open(PROJECT_ROOT / 'actions.json', 'r') as f:
+            actions = json.load(f)
+    except Exception as e:
+        print(f"❌ Failed to load actions.json: {e}")
+        return
+
     print(f"🔌 Control Backend connecting to Switch at {SWITCH_IP}:{SWITCH_PORT}...")
     try:
         switch_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         switch_sock.connect((SWITCH_IP, SWITCH_PORT))
-        # Configure mainLoopSleepTime on first connect
-        print("  ➡️ configure mainLoopSleepTime 0")
-        switch_sock.sendall(b"configure mainLoopSleepTime 0\n")
-        # Fix controls on first connect
-        send_fix_controls(switch_sock)
     except Exception as e:
-        print(f"❌ Failed to connect to Switch: {e}")
-        return
+        _exit_stack(f"failed to connect to Switch sysbot: {e}")
+    # Configure mainLoopSleepTime on first connect
+    print("  ➡️ configure mainLoopSleepTime 0")
+    _switch_send(switch_sock, b"configure mainLoopSleepTime 0\n")
+    # Fix controls on first connect
+    send_fix_controls(switch_sock)
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -74,7 +109,13 @@ def run_control_backend():
         while True:
             conn, addr = server_sock.accept()
             try:
-                data = conn.recv(1024).decode('ascii').strip()
+                conn.settimeout(10)
+                try:
+                    data = conn.recv(1024).decode('ascii').strip()
+                except (UnicodeDecodeError, OSError) as e:
+                    print(f"⚠️ Bad data from {addr}: {e}")
+                    conn.sendall(b"ERR Bad data\n")
+                    continue
                 if not data: continue
 
                 # 1. Special command: fixControls
@@ -85,7 +126,7 @@ def run_control_backend():
                 # 2. Backspace key
                 elif data == "Backspace":
                     print("  ⌨️  Backspace")
-                    switch_sock.sendall(f"key click 42\n".encode('ascii'))
+                    _switch_send(switch_sock, b"key click 42\n")
                     conn.sendall(b"ACK\n")
 
                 # 3. Direct typeString support
@@ -94,7 +135,16 @@ def run_control_backend():
                     type_string(payload, switch_sock)
                     conn.sendall(b"ACK\n")
 
-                # 4. clearAndType: 25x backspace + type in one key command
+                # 4. Raw sysbot passthrough — used by the web manual-control GUI
+                #    to send arbitrary "click X" / "setStick LEFT 0 0" commands
+                #    without needing an actions.json entry per button.
+                elif data.startswith("raw "):
+                    payload = data.split(" ", 1)[1]
+                    print(f"  ➡️ raw: {payload}")
+                    _switch_send(switch_sock, f"{payload}\n".encode('ascii'))
+                    conn.sendall(b"ACK\n")
+
+                # 5. clearAndType: 25x backspace + type in one key command
                 elif data.startswith("clearAndType "):
                     payload = data.split(" ", 1)[1]
                     print(f"  ⌨️  Clear & Type: {payload}")
@@ -106,16 +156,12 @@ def run_control_backend():
                             print(f"  ⚠️  Unsupported char: {char}")
                     cmd = f"key {' '.join(codes)}"
                     print(f"  ➡️ {cmd}")
-                    switch_sock.sendall(f"{cmd}\n".encode('ascii'))
+                    _switch_send(switch_sock, f"{cmd}\n".encode('ascii'))
                     conn.sendall(b"ACK\n")
-                
+
                 # 3. Named Action support
                 else:
                     action_name = data
-                    
-                    with open(PROJECT_ROOT / 'actions.json', 'r') as f:
-                        actions = json.load(f)
-                    
                     if action_name in actions:
                         print(f"🎬 Executing Action: {action_name}")
 
@@ -130,7 +176,7 @@ def run_control_backend():
                                 type_string(payload, switch_sock)
                             else:
                                 print(f"  ➡️ {cmd}")
-                                switch_sock.sendall(f"{cmd}\n".encode('ascii'))
+                                _switch_send(switch_sock, f"{cmd}\n".encode('ascii'))
 
                         conn.sendall(b"ACK\n")
                     else:

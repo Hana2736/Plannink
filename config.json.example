@@ -2,6 +2,10 @@
     "gpu_settings": {
         "HSA_OVERRIDE_GFX_VERSION": "11.0.0"
     },
+    "inference": {
+        "use_gpu": false,
+        "target_fps": 8
+    },
     "paths": {
         "train_data": "TrainData",
         "flat_data": "TrainData_Flat",
@@ -20,6 +24,7 @@
         "control_port": 5002,
         "api_port": 5003,
         "control_host": "127.0.0.1",
+        "control_bind": "0.0.0.0",
         "api_bind": "0.0.0.0"
     },
     "switch_paths": {

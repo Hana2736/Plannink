@@ -1,4 +1,7 @@
+import os
+import re
 import socket
+import signal
 import json
 import time
 import logging
@@ -7,6 +10,7 @@ import queue
 import sys
 import ftplib
 from io import BytesIO
+import socketserver
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from config_loader import load_config
@@ -36,6 +40,22 @@ RESTART_HOURS = 6      # hours before forced restart
 API_PORT = config.get('server', {}).get('api_port', 5003)
 API_SECRET = config['api_secret']
 
+# Latest capture-card snapshot, written by run_vision_ai for the manual GUI.
+FRAME_JPEG_PATH = '/dev/shm/frame.jpg'
+
+# Inference-throttle handshake with run_vision_ai. While this file exists,
+# vision drops to its idle FPS (0.5 fps by default). The state machine sets
+# it whenever process_code_queue is parked at CodeBoxSelected with no work,
+# and clears it the moment a code arrives or any phase function takes over.
+IDLE_MARKER_PATH = '/dev/shm/plannink_idle'
+
+# Pause handshake. While this file exists, vision skips the model call (no
+# inference) and the state machine blocks at every send_action / wait_for_state
+# / process_code_queue iteration. Manual GUI inputs (send_raw) stay exempt —
+# the whole point of pausing is that the user can drive manually without the
+# bot fighting them. Toggled via POST /pause from the web GUI.
+PAUSE_MARKER_PATH = '/dev/shm/plannink_paused'
+
 # --- Request Queue ---
 # Items are (replay_code, result_event, result_dict)
 code_queue = queue.Queue()
@@ -51,32 +71,64 @@ log = logging.getLogger('StateMachine')
 
 # --- FTP Replay Fetch ---
 
+FTP_RETRY_ATTEMPTS = 20
+FTP_RETRY_DELAY = 0.5  # seconds between retries
+
+
+def _ftp_retry(label, fn):
+    """Call fn() up to FTP_RETRY_ATTEMPTS times; return its result on success.
+
+    Absorbs transient Switch-side flakiness (sys-ftpd can be briefly
+    unresponsive under load). Only reboots the stack if every attempt
+    fails — at 20 × 0.5s, that's ~10s of grace before we conclude the
+    Switch really has gone away.
+    """
+    for attempt in range(1, FTP_RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < FTP_RETRY_ATTEMPTS:
+                log.warning(f"FTP {label} attempt {attempt}/{FTP_RETRY_ATTEMPTS} failed: {e}")
+                time.sleep(FTP_RETRY_DELAY)
+            else:
+                _exit_stack(f"FTP {label} failed after {FTP_RETRY_ATTEMPTS} attempts: {e}")
+
+
 def _ftp_connect():
-    """Open an FTP connection to the Switch replay directory. Returns ftp or None."""
-    try:
+    """Open an FTP connection to the Switch replay directory.
+
+    Each retry uses a fresh ftplib.FTP() so we don't reuse a half-dead
+    socket from a previous failed attempt.
+    """
+    def _attempt():
         ftp = ftplib.FTP()
         ftp.connect(SWITCH_IP, FTP_PORT, timeout=10)
         ftp.login(FTP_USER, FTP_PASS)
         ftp.cwd(REPLAY_FTP_DIR)
         return ftp
-    except Exception as e:
-        log.error(f"FTP connect failed: {e}")
-        return None
+    return _ftp_retry('connect', _attempt)
 
 
 def _ftp_parse_storage(ftp):
-    """Download and parse storage.inf. Returns parsed dict or None."""
-    try:
+    """Download and parse storage.inf.
+
+    Covers both RETR failure (transport) and BYML parse failure
+    (unexpected reply from the Switch) — both retried up to
+    FTP_RETRY_ATTEMPTS times before rebooting the stack.
+    """
+    def _attempt():
         inf_buf = BytesIO()
         ftp.retrbinary('RETR storage.inf', inf_buf.write)
         return Byml(inf_buf.getvalue()).parse()
-    except Exception as e:
-        log.error(f"FTP: Failed to parse storage.inf: {e}")
-        return None
+    return _ftp_retry('storage.inf fetch/parse', _attempt)
 
 
 def _ftp_find_filename(inf_data, code):
-    """Look up a replay code in parsed storage.inf. Returns FileName or None."""
+    """Look up a replay code in parsed storage.inf. Returns FileName or None.
+
+    None here is the legitimate 'user submitted a code that isn't on the
+    Switch' case — NOT a connection failure, so don't reboot.
+    """
     for entry in inf_data.get('ReplayInfoArray', []):
         if entry.get('Code') == code:
             return entry.get('FileName')
@@ -86,12 +138,8 @@ def _ftp_find_filename(inf_data, code):
 def check_replay_exists(code):
     """Check if a replay code already exists on the Switch. Returns True/False."""
     ftp = _ftp_connect()
-    if not ftp:
-        return False
     try:
         inf_data = _ftp_parse_storage(ftp)
-        if not inf_data:
-            return False
         return _ftp_find_filename(inf_data, code) is not None
     finally:
         try:
@@ -101,14 +149,14 @@ def check_replay_exists(code):
 
 
 def fetch_replay_file(code):
-    """Fetch the .rpl.zs replay file from the Switch via FTP. Returns raw bytes or None."""
+    """Fetch the .rpl.zs replay file from the Switch via FTP.
+
+    Returns raw bytes, or None if the code isn't in the replay list
+    (legitimate user error). Connection / RETR failures reboot the stack.
+    """
     ftp = _ftp_connect()
-    if not ftp:
-        return None
     try:
         inf_data = _ftp_parse_storage(ftp)
-        if not inf_data:
-            return None
 
         filename = _ftp_find_filename(inf_data, code)
         if not filename:
@@ -117,15 +165,14 @@ def fetch_replay_file(code):
 
         replay_name = f"{filename}.rpl.zs"
         log.info(f"FTP: Downloading {replay_name}")
-        replay_buf = BytesIO()
-        ftp.retrbinary(f'RETR {replay_name}', replay_buf.write)
+        def _attempt():
+            replay_buf = BytesIO()
+            ftp.retrbinary(f'RETR {replay_name}', replay_buf.write)
+            return replay_buf.getvalue()
+        data = _ftp_retry(f'RETR {replay_name}', _attempt)
 
-        data = replay_buf.getvalue()
         log.info(f"FTP: Got {len(data)} bytes for {replay_name}")
         return data
-    except Exception as e:
-        log.error(f"FTP fetch failed for code {code}: {e}")
-        return None
     finally:
         try:
             ftp.quit()
@@ -135,23 +182,338 @@ def fetch_replay_file(code):
 
 # --- HTTP API ---
 
+# Inline manual-control page. Served at GET / with no auth (the page itself
+# has no secrets); JS prompts for the API token on first visit, stores it in
+# localStorage, and attaches it to /input (Bearer header) and /frame.jpg
+# (?token= query param, since <img> can't set headers).
+CONTROL_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Plannink Manual Control</title>
+<style>
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+html, body { margin: 0; padding: 0; background: #111; color: #ddd; font-family: -apple-system, system-ui, sans-serif; }
+.frame { width: 100%; max-width: 720px; margin: 0 auto; background: #000; aspect-ratio: 16/9; display: flex; align-items: center; justify-content: center; border: 3px solid #000; transition: border-color 0.2s; }
+.frame img { width: 100%; height: 100%; object-fit: contain; }
+body.paused .frame { border-color: #c33; }
+#status { text-align: center; font-size: 12px; color: #888; padding: 6px; min-height: 1em; }
+#pausebar { display: flex; justify-content: center; padding: 6px 12px; max-width: 720px; margin: 0 auto; }
+#pause-btn { width: 100%; max-width: 360px; padding: 14px; font-size: 17px; font-weight: 600; border-radius: 10px; border: 1px solid #555; background: #2a2a2a; color: #ddd; cursor: pointer; }
+#pause-btn:active { background: #4a4a4a; }
+body.paused #pause-btn { background: #2a5a2a; border-color: #5c5; color: #cfc; }
+body.paused #pause-btn:active { background: #3a7a3a; }
+.pad { max-width: 720px; margin: 0 auto; padding: 8px 12px 24px; display: flex; flex-direction: column; gap: 14px; }
+.row { display: flex; justify-content: center; gap: 16px; flex-wrap: wrap; }
+.spread { justify-content: space-between; align-items: center; }
+button { background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 10px; padding: 14px 18px; font-size: 17px; min-width: 56px; touch-action: manipulation; cursor: pointer; }
+button:active { background: #4a4a4a; border-color: #888; }
+button.face { width: 64px; height: 64px; border-radius: 50%; font-weight: 600; }
+button.face.a { background: #5a2a2a; } button.face.a:active { background: #aa3a3a; }
+button.face.b { background: #5a4a1a; } button.face.b:active { background: #aa8a2a; }
+button.face.x { background: #1a3a5a; } button.face.x:active { background: #2a6aaa; }
+button.face.y { background: #1a5a3a; } button.face.y:active { background: #2aaa6a; }
+button.shoulder { width: 76px; }
+.dpad { display: grid; grid-template-columns: 56px 56px 56px; grid-template-rows: 56px 56px 56px; gap: 4px; }
+.dpad button { padding: 0; min-width: 0; font-size: 22px; }
+.dpad .up    { grid-column: 2; grid-row: 1; }
+.dpad .left  { grid-column: 1; grid-row: 2; }
+.dpad .right { grid-column: 3; grid-row: 2; }
+.dpad .down  { grid-column: 2; grid-row: 3; }
+.face-grid { display: grid; grid-template-columns: 64px 64px 64px; grid-template-rows: 64px 64px 64px; gap: 6px; }
+.face-grid .x { grid-column: 2; grid-row: 1; }
+.face-grid .y { grid-column: 1; grid-row: 2; }
+.face-grid .a { grid-column: 3; grid-row: 2; }
+.face-grid .b { grid-column: 2; grid-row: 3; }
+.stick { width: 150px; height: 150px; background: radial-gradient(circle at center, #1a1a1a 0%, #2a2a2a 70%, #1a1a1a 100%); border: 2px solid #444; border-radius: 50%; position: relative; touch-action: none; }
+.stick .knob { width: 56px; height: 56px; background: #555; border: 2px solid #777; border-radius: 50%; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); pointer-events: none; transition: background 0.05s; }
+.stick.active .knob { background: #888; }
+.stick-label { text-align: center; font-size: 11px; color: #777; margin-top: 4px; }
+@media (max-width: 480px) {
+  .stick { width: 130px; height: 130px; }
+  .stick .knob { width: 48px; height: 48px; }
+  button { font-size: 15px; padding: 12px 14px; }
+  .dpad { grid-template-columns: 50px 50px 50px; grid-template-rows: 50px 50px 50px; }
+  .face-grid { grid-template-columns: 58px 58px 58px; grid-template-rows: 58px 58px 58px; }
+  button.face { width: 58px; height: 58px; }
+}
+</style>
+</head>
+<body>
+<div class="frame"><img id="frame" alt="capture (loading...)" /></div>
+<div id="pausebar"><button id="pause-btn">⏸ PAUSE BOT</button></div>
+<div id="status">connecting…</div>
+
+<div class="pad">
+  <div class="row spread">
+    <div class="row" style="gap: 8px;">
+      <button class="shoulder" data-cmd="click L">L</button>
+      <button class="shoulder" data-cmd="click ZL">ZL</button>
+    </div>
+    <div class="row" style="gap: 8px;">
+      <button class="shoulder" data-cmd="click ZR">ZR</button>
+      <button class="shoulder" data-cmd="click R">R</button>
+    </div>
+  </div>
+
+  <div class="row spread">
+    <div class="dpad">
+      <button class="up"    data-cmd="click DUP">▲</button>
+      <button class="left"  data-cmd="click DLEFT">◀</button>
+      <button class="right" data-cmd="click DRIGHT">▶</button>
+      <button class="down"  data-cmd="click DDOWN">▼</button>
+    </div>
+    <div class="face-grid">
+      <button class="face x" data-cmd="click X">X</button>
+      <button class="face y" data-cmd="click Y">Y</button>
+      <button class="face a" data-cmd="click A">A</button>
+      <button class="face b" data-cmd="click B">B</button>
+    </div>
+  </div>
+
+  <div class="row spread">
+    <div>
+      <div class="stick" id="lstick"><div class="knob"></div></div>
+      <div class="stick-label">LEFT STICK</div>
+    </div>
+    <div>
+      <div class="stick" id="rstick"><div class="knob"></div></div>
+      <div class="stick-label">RIGHT STICK</div>
+    </div>
+  </div>
+
+  <div class="row">
+    <button data-cmd="click MINUS">−</button>
+    <button data-cmd="click HOME">⌂ HOME</button>
+    <button data-cmd="click PLUS">+</button>
+  </div>
+</div>
+
+<script>
+let token = localStorage.getItem('plannink_token') || '';
+if (!token) {
+  token = (prompt('API token:') || '').trim();
+  if (token) localStorage.setItem('plannink_token', token);
+}
+
+const statusEl = document.getElementById('status');
+let statusTimer = null;
+function setStatus(s, color) {
+  statusEl.textContent = s;
+  statusEl.style.color = color || '#888';
+  if (statusTimer) clearTimeout(statusTimer);
+  statusTimer = setTimeout(() => { statusEl.textContent = ''; }, 2000);
+}
+
+async function send(cmd) {
+  try {
+    const r = await fetch('/input', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'text/plain' },
+      body: cmd
+    });
+    if (r.ok) setStatus(cmd, '#6c6');
+    else setStatus('HTTP ' + r.status + ': ' + cmd, '#e66');
+  } catch (e) {
+    setStatus('NET: ' + e.message, '#e66');
+  }
+}
+
+// Tap-to-click for all buttons with a data-cmd.
+document.querySelectorAll('button[data-cmd]').forEach(btn => {
+  btn.addEventListener('click', () => send(btn.dataset.cmd));
+});
+
+// Pause toggle. Posts to /pause; periodic GET /pause keeps the button in
+// sync if multiple browsers are open or if pause was toggled elsewhere.
+const pauseBtn = document.getElementById('pause-btn');
+let isPaused = false;
+function applyPauseState(paused) {
+  isPaused = paused;
+  document.body.classList.toggle('paused', paused);
+  pauseBtn.textContent = paused ? '▶ RESUME BOT' : '⏸ PAUSE BOT';
+}
+async function refreshPause() {
+  try {
+    const r = await fetch('/pause?token=' + encodeURIComponent(token));
+    if (r.ok) {
+      const txt = (await r.text()).trim();
+      applyPauseState(txt === 'on');
+    }
+  } catch (e) { /* ignore — next poll will retry */ }
+}
+pauseBtn.addEventListener('click', async () => {
+  const want = isPaused ? 'off' : 'on';
+  applyPauseState(want === 'on');  // optimistic
+  try {
+    const r = await fetch('/pause', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'text/plain' },
+      body: want
+    });
+    if (r.ok) {
+      const txt = (await r.text()).trim();
+      applyPauseState(txt === 'on');
+      setStatus(txt === 'on' ? 'PAUSED' : 'RESUMED', txt === 'on' ? '#fc6' : '#6c6');
+    } else {
+      setStatus('PAUSE HTTP ' + r.status, '#e66');
+      refreshPause();  // resync from server
+    }
+  } catch (e) {
+    setStatus('PAUSE NET: ' + e.message, '#e66');
+    refreshPause();
+  }
+});
+refreshPause();
+setInterval(refreshPause, 3000);
+
+// Frame poll. Kept at 15 fps to match what vision writes to /dev/shm/frame.jpg
+// — polling faster just rereads the same JPEG and wastes bandwidth.
+const frame = document.getElementById('frame');
+function refreshFrame() {
+  frame.src = '/frame.jpg?token=' + encodeURIComponent(token) + '&t=' + Date.now();
+}
+refreshFrame();
+setInterval(refreshFrame, 67);
+
+// Sticks. Drag controls deflection; release returns to center.
+// Throttled to 10 Hz to avoid hammering the backend.
+function bindStick(el, side) {
+  const knob = el.querySelector('.knob');
+  let active = false;
+  let lastSent = 0;
+  let lastX = 0, lastY = 0;
+
+  const hex = v => (v < 0 ? '-' : '') + '0x' + Math.abs(v).toString(16);
+  const sendStick = (xi, yi, force) => {
+    const now = Date.now();
+    if (!force && (xi === lastX && yi === lastY)) return;
+    if (!force && now - lastSent < 100) return;
+    lastSent = now; lastX = xi; lastY = yi;
+    send('setStick ' + side + ' ' + hex(xi) + ' ' + hex(yi));
+  };
+
+  const onMove = (clientX, clientY) => {
+    const rect = el.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    let dx = clientX - cx;
+    let dy = clientY - cy;
+    const max = rect.width / 2 - 28;
+    const r = Math.hypot(dx, dy);
+    if (r > max) { dx *= max / r; dy *= max / r; }
+    knob.style.left = 'calc(50% + ' + dx + 'px)';
+    knob.style.top  = 'calc(50% + ' + dy + 'px)';
+    let nx = dx / max;
+    let ny = -dy / max;  // sysbot Y axis: + = up, screen Y: + = down
+    // 5% deadzone so tiny wobbles don't spam updates.
+    if (Math.hypot(nx, ny) < 0.05) { nx = 0; ny = 0; }
+    sendStick(Math.round(nx * 0x7000), Math.round(ny * 0x7000), false);
+  };
+
+  const release = () => {
+    if (!active) return;
+    active = false;
+    el.classList.remove('active');
+    knob.style.left = '50%';
+    knob.style.top  = '50%';
+    sendStick(0, 0, true);
+  };
+
+  el.addEventListener('mousedown', e => { active = true; el.classList.add('active'); onMove(e.clientX, e.clientY); });
+  document.addEventListener('mousemove', e => { if (active) onMove(e.clientX, e.clientY); });
+  document.addEventListener('mouseup', release);
+  el.addEventListener('touchstart', e => { active = true; el.classList.add('active'); const t = e.touches[0]; onMove(t.clientX, t.clientY); e.preventDefault(); }, { passive: false });
+  el.addEventListener('touchmove',  e => { if (active) { const t = e.touches[0]; onMove(t.clientX, t.clientY); e.preventDefault(); } }, { passive: false });
+  el.addEventListener('touchend',   e => { release(); e.preventDefault(); }, { passive: false });
+  el.addEventListener('touchcancel',e => { release(); e.preventDefault(); }, { passive: false });
+}
+bindStick(document.getElementById('lstick'), 'LEFT');
+bindStick(document.getElementById('rstick'), 'RIGHT');
+</script>
+</body>
+</html>
+"""
+
+# Whitelist for raw sysbot commands posted via the manual-control GUI.
+# Allows: letters (button names like A/ZL/DUP), digits, spaces (separators),
+# hyphen (negative stick coords), underscore. No newlines = no command injection.
+_INPUT_CMD_RE = re.compile(r'^[A-Za-z0-9 _\-]{1,120}$')
+
+
 class ReplayCodeHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.connection.settimeout(30)
+        path, _, _ = self.path.partition('?')
+        if path in ('/', '/control'):
+            return self._serve_control_page()
+        if path == '/frame.jpg':
+            if not self._auth_ok():
+                return
+            return self._serve_frame()
+        if path == '/pause':
+            if not self._auth_ok():
+                return
+            return self._send_text(200, b'on' if _paused.is_set() else b'off')
+        self._send_text(404, b'Not found')
+
     def do_POST(self):
-        if self.path != '/replay':
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'Not found')
-            return
+        self.connection.settimeout(30)
+        path, _, _ = self.path.partition('?')
+        if path == '/replay':
+            return self._handle_replay()
+        if path == '/input':
+            return self._handle_input()
+        if path == '/pause':
+            return self._handle_pause()
+        self._send_text(404, b'Not found')
 
-        # Auth check
+    # ----- helpers -----
+
+    def _send_text(self, code, body, content_type='text/plain'):
+        self.send_response(code)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _query_params(self):
+        _, _, query = self.path.partition('?')
+        out = {}
+        for kv in query.split('&'):
+            if not kv:
+                continue
+            k, _, v = kv.partition('=')
+            out[k] = v
+        return out
+
+    def _auth_ok(self):
+        """Bearer header OR ?token= query param. Sends 401 + returns False on fail.
+
+        Query-param fallback exists because <img src=...> tags can't set
+        custom headers, so the GUI's frame poll authenticates via ?token=.
+        """
         auth = self.headers.get('Authorization', '')
-        if auth != f'Bearer {API_SECRET}':
-            self.send_response(401)
-            self.end_headers()
-            self.wfile.write(b'Unauthorized')
+        if auth == f'Bearer {API_SECRET}':
+            return True
+        if self._query_params().get('token') == API_SECRET:
+            return True
+        self._send_text(401, b'Unauthorized')
+        return False
+
+    # ----- routes -----
+
+    def _handle_replay(self):
+        if not self._auth_ok():
             return
 
-        length = int(self.headers.get('Content-Length', 0))
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except (ValueError, TypeError):
+            return self._send_text(400, b'Invalid Content-Length')
+        if length > 512:
+            return self._send_text(413, b'Request body too large')
         body = self.rfile.read(length).decode('utf-8').strip()
 
         try:
@@ -162,10 +524,7 @@ class ReplayCodeHandler(BaseHTTPRequestHandler):
 
         code = code.upper()
         if not code or len(code) != 16 or not code.isalnum() or code[0] != 'R':
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'Invalid replay code: must be 16 alphanumeric characters starting with R')
-            return
+            return self._send_text(400, b'Invalid replay code: must be 16 alphanumeric characters starting with R')
 
         log.info(f"API: Received replay code: {code}")
 
@@ -173,9 +532,13 @@ class ReplayCodeHandler(BaseHTTPRequestHandler):
         result_event = threading.Event()
         result_dict = {}
         code_queue.put((code, result_event, result_dict))
+        # Pre-clear idle so vision starts ramping up to full FPS before the
+        # state machine wakes from its 1-second queue timeout.
+        _clear_idle()
 
-        # Block until the state machine types the code
-        result_event.wait()
+        # Block until the state machine types the code (120s max)
+        if not result_event.wait(timeout=120):
+            return self._send_text(504, b'Timed out waiting for state machine')
 
         if result_dict.get('ok'):
             replay_data = result_dict.get('replay_data')
@@ -186,20 +549,93 @@ class ReplayCodeHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(replay_data)
             else:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(b'FTP fetch failed: could not retrieve replay file')
+                self._send_text(500, b'FTP fetch failed: could not retrieve replay file')
         else:
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(result_dict.get('error', 'Unknown error').encode())
+            self._send_text(500, result_dict.get('error', 'Unknown error').encode())
+
+    def _handle_input(self):
+        """Forward a raw sysbot command (button click, stick deflection) to
+        control_backend. Used by the web manual-control GUI.
+
+        ACK failures here trigger _exit_stack just like automated inputs,
+        so the user's manual press will reboot the stack if the socket is
+        dead — same semantics as automation, by design.
+        """
+        if not self._auth_ok():
+            return
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except (ValueError, TypeError):
+            return self._send_text(400, b'Invalid Content-Length')
+        if length > 128:
+            return self._send_text(413, b'Command too long')
+        try:
+            body = self.rfile.read(length).decode('ascii').strip()
+        except UnicodeDecodeError:
+            return self._send_text(400, b'Invalid command encoding')
+        if not _INPUT_CMD_RE.match(body):
+            return self._send_text(400, b'Invalid command')
+        # Manual presses change Switch state; vision needs full FPS to track.
+        _clear_idle()
+        send_raw(body)
+        self._send_text(200, b'OK')
+
+    def _handle_pause(self):
+        """Toggle the pause flag. Body: 'on' or 'off' (case-insensitive)."""
+        if not self._auth_ok():
+            return
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except (ValueError, TypeError):
+            return self._send_text(400, b'Invalid Content-Length')
+        if length > 16:
+            return self._send_text(413, b'Body too long')
+        try:
+            body = self.rfile.read(length).decode('ascii').strip().lower()
+        except UnicodeDecodeError:
+            return self._send_text(400, b'Invalid encoding')
+        if body == 'on':
+            _set_paused(True)
+            log.warning("PAUSE requested via API")
+            return self._send_text(200, b'on')
+        if body == 'off':
+            _set_paused(False)
+            log.warning("RESUME requested via API")
+            return self._send_text(200, b'off')
+        self._send_text(400, b'Body must be "on" or "off"')
+
+    def _serve_control_page(self):
+        body = CONTROL_PAGE_HTML.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_frame(self):
+        try:
+            with open(FRAME_JPEG_PATH, 'rb') as f:
+                body = f.read()
+        except (FileNotFoundError, OSError):
+            return self._send_text(503, b'No frame yet')
+        self.send_response(200)
+        self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
         log.info(f"API: {args[0]}")
 
 
+class _ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
 def start_api_server():
-    server = HTTPServer((API_BIND, API_PORT), ReplayCodeHandler)
+    server = _ThreadedHTTPServer((API_BIND, API_PORT), ReplayCodeHandler)
     log.info(f"API server listening on {API_BIND}:{API_PORT}")
     server.serve_forever()
 
@@ -224,23 +660,50 @@ def read_state():
         return None
 
 
-def send_action(name):
-    """Send a named action to the control backend. Blocks until ACK."""
-    log.info(f"ACTION: {name}")
+def _send_to_backend(line, label):
+    """Open a one-shot socket to control_backend, write `line`, expect ACK.
+
+    Shared by send_action (named actions) and send_raw (sysbot passthrough
+    for the manual-control GUI). On any failure — socket exception or
+    non-ACK reply — reboots the whole stack: a missing ACK means the
+    input didn't land, so any assumption about Switch state is now stale.
+    """
+    log.info(f"ACTION: {label}")
+    resp = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(30)
         s.connect((CONTROL_HOST, CONTROL_PORT))
-        s.sendall(f"{name}\n".encode('ascii'))
+        s.sendall(f"{line}\n".encode('ascii'))
         resp = s.recv(1024).decode('ascii').strip()
         s.close()
-        if not resp.startswith('ACK'):
-            log.warning(f"Non-ACK response for {name}: {resp}")
-            return False
-        return True
     except Exception as e:
-        log.error(f"Failed to send action {name}: {e}")
-        return False
+        _exit_stack(f"control backend unreachable for {label}: {e}")
+    if not resp.startswith('ACK'):
+        _exit_stack(f"non-ACK reply for {label}: {resp!r}")
+    return True
+
+
+def send_action(name):
+    """Send a named action (defined in actions.json). Blocks until ACK.
+
+    Honors the pause flag — if the bot is paused, this blocks until the
+    user resumes, so phase functions naturally halt at the next controller
+    input without leaving the Switch in a half-action state.
+    """
+    _wait_if_paused()
+    return _send_to_backend(name, name)
+
+
+def send_raw(cmd):
+    """Forward an arbitrary sysbot command via control_backend's `raw` route.
+
+    Used by the web manual-control GUI to fire individual buttons / stick
+    deflections that don't have actions.json entries. Newlines are stripped
+    as defense-in-depth on top of the HTTP-layer whitelist regex.
+    """
+    cmd = cmd.replace('\n', '').replace('\r', '')
+    return _send_to_backend(f"raw {cmd}", f"raw {cmd}")
 
 
 def send_action_repeated(name, times, interval):
@@ -267,6 +730,16 @@ def wait_for_state(targets, timeout, poll_action=None, poll_interval=None):
     last_poll_action = 0
 
     while time.time() < deadline:
+        # Pause handling: while paused, freeze the deadline so the user can
+        # take as long as they need without expiring the wait. Reset the
+        # agreement window after resuming since vision was offline.
+        if _paused.is_set():
+            paused_at = time.time()
+            _wait_if_paused()
+            deadline += time.time() - paused_at
+            agree_label = None
+            agree_start = None
+            continue
         # Check watchdog
         _check_watchdog()
 
@@ -394,11 +867,21 @@ def phase_home_boot():
 
 
 def phase_title_wait():
-    """Phase 2: Wait for title screen, then press ZL+ZR."""
+    """Phase 2: Wait for title screen, then press ZL+ZR.
+    During Splatfest the AI may misrecognize the title screen as
+    LobbyVersus_LobbyWandering or BankaraPlaza_FreeRoam, so we accept
+    those labels here too. Safe because this phase runs immediately
+    after HOME_BOOT — we can't legitimately be at LobbyWandering or
+    FreeRoam yet."""
     log.info("=== Phase 2: TITLE_WAIT ===")
-    result = wait_for_state('BankaraPlaza_TitleScreen', 60)
+    result = wait_for_state(
+        ['BankaraPlaza_TitleScreen',
+         'LobbyVersus_LobbyWandering',
+         'BankaraPlaza_FreeRoam'], 60)
     if not result:
         return False
+    if result != 'BankaraPlaza_TitleScreen':
+        log.info(f"Splatfest title screen detected (misclassified as {result})")
     time.sleep(5)
     send_action('ClickZLZR')
     return True
@@ -570,33 +1053,62 @@ def phase_code_entry():
 
 
 def process_code_queue():
-    """Wait at CodeBoxSelected for codes from the API. Types, submits, handles result. Returns False if state is lost."""
-    while True:
-        _check_watchdog()
+    """Wait at CodeBoxSelected for codes from the API. Types, submits, handles result. Returns False if state is lost.
 
-        try:
-            code, result_event, result_dict = code_queue.get(timeout=1)
-        except queue.Empty:
-            # Verify we're still at code box while idling
-            state = read_state()
-            if state and state[0] not in ('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 'SoftwareKeyboard'):
-                log.warning(f"Lost CodeBoxSelected while idling (now: {state[0]})")
+    Sets the idle marker while parked on the queue so vision drops to its
+    low-rate inference FPS, and clears it the moment a code is picked up
+    (or on any exit path) so the upcoming wait_for_state calls get full
+    8-fps inference. The try/finally guarantees we never leave the marker
+    set after this function returns.
+    """
+    _set_idle()
+    try:
+        while True:
+            _wait_if_paused()
+            _check_watchdog()
+
+            try:
+                code, result_event, result_dict = code_queue.get(timeout=1)
+            except queue.Empty:
+                # Verify we're still at code box while idling
+                state = read_state()
+                if state and state[0] not in ('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 'SoftwareKeyboard'):
+                    log.warning(f"Lost CodeBoxSelected while idling (now: {state[0]})")
+                    return False
+                # API handler may have pre-emptively cleared the marker on a
+                # put we haven't picked up yet, or on a manual GUI input. If
+                # the queue is genuinely empty and state is still neutral,
+                # re-assert idle so vision drops back to 0.5 fps.
+                if code_queue.empty():
+                    _set_idle()
+                continue
+
+            # Got work — disable idle for the entire processing path.
+            _clear_idle()
+
+            try:
+                api_result = _process_single_code(code, result_event, result_dict)
+            except Exception:
+                if not result_event.is_set():
+                    result_dict['error'] = 'Internal error during processing'
+                    result_event.set()
+                raise
+
+            if api_result is None:
+                if not result_event.is_set():
+                    result_dict['error'] = 'State lost during processing'
+                    result_event.set()
                 return False
-            continue
-
-        # Process this code through the full submit flow
-        api_result = _process_single_code(code, result_event, result_dict)
-
-        if api_result is None:
-            if not result_event.is_set():
-                result_dict['error'] = 'State lost during processing'
+            elif not result_event.is_set():
+                # ok/duplicate — notify client now
+                result_dict['ok'] = True
                 result_event.set()
-            return False
-        elif not result_event.is_set():
-            # ok/duplicate — notify client now
-            result_dict['ok'] = True
-            result_event.set()
-            log.info(f"Replay code result '{api_result}': {code}")
+                log.info(f"Replay code result '{api_result}': {code}")
+
+            # Loop continues; top-of-loop _set_idle re-arms idle for the next wait.
+            _set_idle()
+    finally:
+        _clear_idle()
 
 
 def _process_single_code(code, result_event, result_dict):
@@ -749,12 +1261,122 @@ def _return_to_codebox():
     wait_for_state('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 15)
 
 
+# --- Pause primitive ---
+
+# Set = paused; cleared = running. Read by send_action / wait_for_state /
+# process_code_queue at strategic points so the bot stops sending controls
+# within ~1 second of a pause request, without leaving the system in a
+# weird half-action state.
+_paused = threading.Event()
+
+# Seconds to wait inside _wait_if_paused after the pause clears, giving
+# vision time to refresh /dev/shm/state before we read it again. With 8 fps
+# inference that's 8 frames of fresh state.
+PAUSE_SETTLE_DELAY = 1.0
+PAUSE_POLL_INTERVAL = 0.5
+
+
+def _wait_if_paused():
+    """Block while the pause flag is set. No-op if not paused.
+
+    After a pause clears, sleep PAUSE_SETTLE_DELAY so vision has time to
+    write fresh state to /dev/shm/state — otherwise the next read_state()
+    call could see whatever the AI was looking at right before we paused.
+    """
+    if not _paused.is_set():
+        return
+    log.info("PAUSED — state machine blocked")
+    while _paused.is_set():
+        time.sleep(PAUSE_POLL_INTERVAL)
+    log.info(f"RESUMED — settling for {PAUSE_SETTLE_DELAY}s")
+    time.sleep(PAUSE_SETTLE_DELAY)
+
+
+def _set_paused(on):
+    """Toggle the pause flag and the marker file together so vision and
+    the state machine stay in sync."""
+    if on:
+        _paused.set()
+        try:
+            with open(PAUSE_MARKER_PATH, 'w') as f:
+                f.write('')
+        except Exception:
+            pass
+    else:
+        _paused.clear()
+        try:
+            os.remove(PAUSE_MARKER_PATH)
+        except (FileNotFoundError, OSError):
+            pass
+
+
+def _set_idle():
+    """Touch the idle marker so vision drops to its low-rate inference FPS."""
+    try:
+        with open(IDLE_MARKER_PATH, 'w') as f:
+            f.write('')
+    except Exception:
+        pass
+
+
+def _clear_idle():
+    """Remove the idle marker so vision returns to normal inference FPS.
+
+    Called preemptively from API handlers (so vision starts ramping up
+    before the state machine even wakes from its 1-second queue timeout)
+    and from process_code_queue's try/finally on exit.
+    """
+    try:
+        os.remove(IDLE_MARKER_PATH)
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _drain_queue(reason='State machine restarting'):
+    """Signal all pending queue items so blocked HTTP handlers unblock immediately."""
+    while True:
+        try:
+            _, ev, rd = code_queue.get_nowait()
+            if not ev.is_set():
+                rd['error'] = reason
+                ev.set()
+        except queue.Empty:
+            break
+
+
+def _exit_stack(reason):
+    """Reboot the entire supervised stack.
+
+    Used when a Switch-facing connection (control_backend ACK socket,
+    sysbot, FTP) fails or returns garbage. Once we can't trust state
+    on the Switch, recovering in-process is unsafe — vision, control,
+    and statemachine all need to come up fresh against reconnected
+    sockets. We SIGTERM supervisord (PID 1 in the container, pidfile
+    at /tmp/supervisord.pid), which gracefully stops all three
+    programs and exits the container; docker-compose's
+    `restart: unless-stopped` then relaunches everything.
+    """
+    log.error(f"FATAL: {reason} — rebooting stack")
+    _drain_queue(f'Stack rebooting: {reason}')
+    try:
+        with open('/tmp/supervisord.pid') as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (FileNotFoundError, ProcessLookupError, ValueError, PermissionError, OSError):
+        pass
+    sys.exit(1)
+
+
 # --- Main Loop ---
 
 def run_state_machine():
     global _boot_splash_last
 
     log.info("State Machine starting")
+    # Clear any stale markers from a previous run so vision starts at
+    # full inference FPS during boot navigation phases.
+    _clear_idle()
+    _set_paused(False)
 
     # Start HTTP API server in background thread
     api_thread = threading.Thread(target=start_api_server, daemon=True)
@@ -762,6 +1384,7 @@ def run_state_machine():
 
     while True:
         try:
+            _wait_if_paused()
             _boot_splash_last = time.time()
 
             # Phase 1: HOME_BOOT
@@ -827,15 +1450,18 @@ def run_state_machine():
 
         except QuitAndRestart:
             log.warning("QuitAndRestart triggered, restarting from HOME")
+            _drain_queue('State machine restarting (watchdog)')
             quit_game_and_wait()
             continue
 
         except KeyboardInterrupt:
             log.info("Interrupted by user, exiting")
+            _drain_queue('State machine shutting down')
             break
 
         except Exception as e:
             log.error(f"Unexpected error: {e}", exc_info=True)
+            _drain_queue('State machine error')
             quit_game_and_wait()
             time.sleep(5)
 

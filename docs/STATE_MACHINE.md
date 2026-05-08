@@ -13,7 +13,7 @@ The system uses an **Agreement Period** of 3.0 seconds.
 ### 2. Platform Compatibility & Performance
 - **AMD ROCm**: Optimized for RX 7000 series. Uses `HSA_OVERRIDE_GFX_VERSION=11.0.0`.
 - **NVIDIA CUDA**: Compatible if PyTorch is reinstalled for CUDA.
-- **Hardware Requirement**: Stable 60fps capture is critical. However, inference FPS is flexible. I hacked this together to work on my NAS and found targeting 8FPS works fine.
+- **Hardware Requirement**: Stable 60fps capture is critical. If the AI framerate drops, the "3-second agreement" effectively takes longer in real-time, slowing down the machine.
 
 ### 3. Watchdogs & Forced Recovery
 The system handles hangs via a `QuitAndRestart` exception:
