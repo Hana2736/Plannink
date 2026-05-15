@@ -9,6 +9,9 @@ _ENV_OVERRIDES = {
     'PLANNINK_CONTROL_HOST': ('server', 'control_host'),
     'PLANNINK_SHM_PATH':     ('paths', 'shm_state'),
     'PLANNINK_API_SECRET':   ('api_secret',),
+    'PLANNINK_GEM_BIND':     ('gem', 'bind'),
+    'PLANNINK_GEM_PORT':     ('gem', 'port'),
+    'PLANNINK_POOL_INGEST_TOKEN': ('pool_ingest', 'token'),
 }
 
 def load_config():

@@ -10,12 +10,12 @@ The system consists of three main components working in tandem:
 
 1.  **Vision AI (`run_vision_ai.py`)**: Captures 1080p60 video from a capture card, runs a ResNet-34 classifier to identify the current game screen, and writes the state to shared memory.
 2.  **Control Backend (`control_backend.py`)**: Connects to the Switch (via `sys-botbase`) and provides a local socket API to execute button presses, stick movements, and HID keyboard strings.
-3.  **State Machine (`state_machine.py`)**: The "brain" that reads AI states, handles the complex navigation logic, manages a replay code queue, and exposes a REST API for external requests.
+3.  **State Machine (`state_machine.py`)**: The "brain" that reads AI states, handles the complex navigation logic, manages a replay code queue, exposes a REST API for external requests, and bridges those requests to the **gem worker** running inside the game on the Switch. Plannink walks the player to the replay code box; codes are then fetched by gem (no typing, no FTP).
 
 ## 🛠️ Requirements
 
 -   **Hardware**: 
-    -   Nintendo Switch with `sys-botbase` and `sys-ftpd` installed. Atmosphere must be configured to redirect cache save to the SD card.
+    -   Nintendo Switch with `sys-botbase` installed and the **gem** game mod loaded. gem's `sd:/gem/config.txt` must point `server=`/`port=` at this machine's gem socket (default `6388`); the console connects out to Plannink.
     -   HDMI Capture Card (specifically tested with UGREEN 1080p60). I tested this using botbase's screen capture but performance was unusable on Erista.
     -   **GPU**: This project is optimized for **AMD GPUs** (RX 7000 series) using ROCm 6.2. I get about 250FPS of inference, so lots of headroom.
         -   *NVIDIA*: Will require changing the PyTorch install command to a CUDA-capable version. This should be pretty easy, PRs welcome.
@@ -34,7 +34,7 @@ The system consists of three main components working in tandem:
         ```bash
         cp config.json.example config.json
         ```
-    -   Edit `config.json` with your Switch IP, FTP credentials, API secret, and hardware settings.
+    -   Edit `config.json` with your Switch IP, API secret, gem socket bind/port, and hardware settings.
 3.  **Run**:
     -   **Terminal 1**: `python Tools/run_vision_ai.py` (Vision & Data Collector)
     -   **Terminal 2**: `python Tools/control_backend.py` (Controller Bridge)

@@ -8,27 +8,22 @@ import logging
 import threading
 import queue
 import sys
-import ftplib
-from io import BytesIO
 import socketserver
+import urllib.request
+import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from config_loader import load_config
+from gem_client import (
+    GemServer, GemNotConnected, GemTimeout, GemReplayError,
+    ERR_BAD_REPLAY_CODE,
+)
 
 # --- Config ---
 config = load_config()
 PROJECT_ROOT = Path(__file__).parent.parent
 
-# Add byml library to path
-sys.path.insert(0, str(PROJECT_ROOT / 'Tools' / 'byml-v2-2.4.5'))
-from byml import Byml
-
 SHM_PATH = config['paths']['shm_state']
-SWITCH_IP = config['switch']['ip']
-FTP_USER = config['switch']['ftp_user']
-FTP_PASS = config['switch']['ftp_pass']
-FTP_PORT = config['switch']['ftp_port']
-REPLAY_FTP_DIR = config.get('switch_paths', {}).get('replay_dir', '')
 CONTROL_PORT = config.get('server', {}).get('control_port', 5002)
 CONTROL_HOST = config.get('server', {}).get('control_host', '127.0.0.1')
 API_BIND = config.get('server', {}).get('api_bind', '0.0.0.0')
@@ -36,9 +31,21 @@ API_BIND = config.get('server', {}).get('api_bind', '0.0.0.0')
 AGREE_TIME = 3.0      # seconds of consistent state before acting
 POLL_INTERVAL = 0.1    # seconds between state polls
 WATCHDOG_ERR_TIME = 3  # seconds of SystemWindow/OSErr before forced quit
-RESTART_HOURS = 6      # hours before forced restart
 API_PORT = config.get('server', {}).get('api_port', 5003)
 API_SECRET = config['api_secret']
+
+# Gem socket: we listen, the console (gem-injected game) dials out to us.
+# Bind 0.0.0.0 so the other console on the LAN can reach it.
+GEM_BIND = config.get('gem', {}).get('bind', '0.0.0.0')
+# int() guards against the env-override path, which always yields strings.
+GEM_PORT = int(config.get('gem', {}).get('port', 6388))
+GEM_SUBMIT_TIMEOUT = int(config.get('gem', {}).get('submit_timeout', 90))
+
+# Pool ingest: when the console reports a freshly uploaded replay, push the
+# code up to the main app. Token can also come from PLANNINK_POOL_INGEST_TOKEN.
+POOL_INGEST_URL = config.get('pool_ingest', {}).get(
+    'url', 'https://hana.lol/inksight/pool_ingest_code')
+POOL_INGEST_TOKEN = config.get('pool_ingest', {}).get('token', '')
 
 # Mirror the inference rates run_vision_ai.py uses, so /status can report
 # the right number to the GUI without a second source of truth.
@@ -73,117 +80,37 @@ logging.basicConfig(
 )
 log = logging.getLogger('StateMachine')
 
+# --- Gem worker bridge ---
 
-# --- FTP Replay Fetch ---
+def _pool_ingest_code(code):
+    """Forward a freshly-uploaded replay code to the main app.
 
-FTP_RETRY_ATTEMPTS = 20
-FTP_RETRY_DELAY = 0.5  # seconds between retries
-
-
-def _ftp_retry(label, fn):
-    """Call fn() up to FTP_RETRY_ATTEMPTS times; return its result on success.
-
-    Absorbs transient Switch-side flakiness (sys-ftpd can be briefly
-    unresponsive under load). Only reboots the stack if every attempt
-    fails — at 20 × 0.5s, that's ~10s of grace before we conclude the
-    Switch really has gone away.
+    Best-effort: runs on a gem-spawned daemon thread, never raises, and
+    never touches the queue or state machine — a failed ingest must not
+    affect replay serving.
     """
-    for attempt in range(1, FTP_RETRY_ATTEMPTS + 1):
-        try:
-            return fn()
-        except Exception as e:
-            if attempt < FTP_RETRY_ATTEMPTS:
-                log.warning(f"FTP {label} attempt {attempt}/{FTP_RETRY_ATTEMPTS} failed: {e}")
-                time.sleep(FTP_RETRY_DELAY)
-            else:
-                _exit_stack(f"FTP {label} failed after {FTP_RETRY_ATTEMPTS} attempts: {e}")
-
-
-def _ftp_connect():
-    """Open an FTP connection to the Switch replay directory.
-
-    Each retry uses a fresh ftplib.FTP() so we don't reuse a half-dead
-    socket from a previous failed attempt.
-    """
-    def _attempt():
-        ftp = ftplib.FTP()
-        ftp.connect(SWITCH_IP, FTP_PORT, timeout=10)
-        ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(REPLAY_FTP_DIR)
-        return ftp
-    return _ftp_retry('connect', _attempt)
-
-
-def _ftp_parse_storage(ftp):
-    """Download and parse storage.inf.
-
-    Covers both RETR failure (transport) and BYML parse failure
-    (unexpected reply from the Switch) — both retried up to
-    FTP_RETRY_ATTEMPTS times before rebooting the stack.
-    """
-    def _attempt():
-        inf_buf = BytesIO()
-        ftp.retrbinary('RETR storage.inf', inf_buf.write)
-        return Byml(inf_buf.getvalue()).parse()
-    return _ftp_retry('storage.inf fetch/parse', _attempt)
-
-
-def _ftp_find_filename(inf_data, code):
-    """Look up a replay code in parsed storage.inf. Returns FileName or None.
-
-    None here is the legitimate 'user submitted a code that isn't on the
-    Switch' case — NOT a connection failure, so don't reboot.
-    """
-    for entry in inf_data.get('ReplayInfoArray', []):
-        if entry.get('Code') == code:
-            return entry.get('FileName')
-    return None
-
-
-def check_replay_exists(code):
-    """Check if a replay code already exists on the Switch. Returns True/False."""
-    ftp = _ftp_connect()
+    if not POOL_INGEST_TOKEN:
+        log.warning(f"Pool ingest: no token configured, dropping {code}")
+        return
+    payload = json.dumps({'code': code}).encode('utf-8')
+    req = urllib.request.Request(
+        POOL_INGEST_URL, data=payload, method='POST',
+        headers={
+            'Authorization': f'Bearer {POOL_INGEST_TOKEN}',
+            'Content-Type': 'application/json',
+        },
+    )
     try:
-        inf_data = _ftp_parse_storage(ftp)
-        return _ftp_find_filename(inf_data, code) is not None
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            pass
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            log.info(f"Pool ingest: {code} -> HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        log.error(f"Pool ingest: {code} -> HTTP {e.code} {e.reason}")
+    except (urllib.error.URLError, OSError) as e:
+        log.error(f"Pool ingest: {code} failed: {e}")
 
 
-def fetch_replay_file(code):
-    """Fetch the .rpl.zs replay file from the Switch via FTP.
-
-    Returns raw bytes, or None if the code isn't in the replay list
-    (legitimate user error). Connection / RETR failures reboot the stack.
-    """
-    ftp = _ftp_connect()
-    try:
-        inf_data = _ftp_parse_storage(ftp)
-
-        filename = _ftp_find_filename(inf_data, code)
-        if not filename:
-            log.warning(f"FTP: No replay entry found for code {code}")
-            return None
-
-        replay_name = f"{filename}.rpl.zs"
-        log.info(f"FTP: Downloading {replay_name}")
-        def _attempt():
-            replay_buf = BytesIO()
-            ftp.retrbinary(f'RETR {replay_name}', replay_buf.write)
-            return replay_buf.getvalue()
-        data = _ftp_retry(f'RETR {replay_name}', _attempt)
-
-        log.info(f"FTP: Got {len(data)} bytes for {replay_name}")
-        return data
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            pass
-
+# We are the server; the console (gem-injected game) connects out to us.
+gem_server = GemServer(GEM_BIND, GEM_PORT, log, on_replay_code=_pool_ingest_code)
 
 # --- HTTP API ---
 
@@ -564,17 +491,19 @@ class ReplayCodeHandler(BaseHTTPRequestHandler):
 
         log.info(f"API: Received replay code: {code}")
 
-        # Queue the request and wait for the state machine to process it
+        # Queue the request and wait for the state machine to hand it to gem.
+        # We no longer pre-clear idle: once parked at the code box the AI
+        # stays idled (we hand codes straight to the gem worker rather than
+        # typing them, so vision isn't needed to track entry).
         result_event = threading.Event()
         result_dict = {}
         code_queue.put((code, result_event, result_dict))
-        # Pre-clear idle so vision starts ramping up to full FPS before the
-        # state machine wakes from its 1-second queue timeout.
-        _clear_idle()
 
-        # Block until the state machine types the code (120s max)
+        # Block until the state machine resolves the code (120s max). This
+        # is the local-queue deadline (e.g. not yet parked at the code box);
+        # the gem worker has its own, shorter, submit timeout.
         if not result_event.wait(timeout=120):
-            return self._send_text(504, b'Timed out waiting for state machine')
+            return self._send_text(500, b'Timed out waiting for state machine')
 
         if result_dict.get('ok'):
             replay_data = result_dict.get('replay_data')
@@ -585,9 +514,13 @@ class ReplayCodeHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(replay_data)
             else:
-                self._send_text(500, b'FTP fetch failed: could not retrieve replay file')
+                self._send_text(500, b'Replay download returned no data')
         else:
-            self._send_text(500, result_dict.get('error', 'Unknown error').encode())
+            # Specific failure type chosen by _process_single_code:
+            #   404 -> gem BadReplayCode (code invalid / replay not found)
+            #   500 -> gem ReplayDownloadFailure / not connected / timeout
+            status = result_dict.get('error_status', 500)
+            self._send_text(status, result_dict.get('error', 'Unknown error').encode())
 
     def _handle_input(self):
         """Forward a raw sysbot command (button click, stick deflection) to
@@ -845,7 +778,6 @@ def clickb_reset(return_to_state, timeout):
 # --- Watchdog State ---
 _watchdog_err_label = None
 _watchdog_err_start = None
-_boot_splash_last = time.time()  # reset on BootSplash sighting
 
 
 class QuitAndRestart(Exception):
@@ -854,7 +786,7 @@ class QuitAndRestart(Exception):
 
 
 def _check_watchdog():
-    global _watchdog_err_label, _watchdog_err_start, _boot_splash_last
+    global _watchdog_err_label, _watchdog_err_start
 
     state = read_state()
     if not state:
@@ -862,10 +794,6 @@ def _check_watchdog():
 
     label = state[0]
     now = time.time()
-
-    # Track BootSplash for 6-hour timer
-    if label == 'BootSplash':
-        _boot_splash_last = now
 
     # SystemWindow / OSErr watchdog
     if label in ('SystemWindow', 'OSErr'):
@@ -879,11 +807,6 @@ def _check_watchdog():
     else:
         _watchdog_err_label = None
         _watchdog_err_start = None
-
-    # 6-hour restart timer
-    if now - _boot_splash_last > RESTART_HOURS * 3600:
-        log.error(f"Watchdog triggered: {RESTART_HOURS}h since last BootSplash")
-        raise QuitAndRestart()
 
 
 def quit_game_and_wait():
@@ -1118,15 +1041,21 @@ def phase_code_entry():
 
 
 def process_code_queue():
-    """Wait at CodeBoxSelected for codes from the API. Types, submits, handles result. Returns False if state is lost.
+    """Wait at CodeBoxSelected for codes from the API, hand each to the gem
+    worker, return the result. Returns False if state is lost.
 
-    Sets the idle marker while parked on the queue so vision drops to its
-    low-rate inference FPS, and clears it the moment a code is picked up
-    (or on any exit path) so the upcoming wait_for_state calls get full
-    8-fps inference. The try/finally guarantees we never leave the marker
-    set after this function returns.
+    Once parked here the AI stays idled the whole time: we hand codes
+    straight to the gem worker instead of typing them, so vision is only
+    needed to notice a crash (the SystemWindow/OSErr watchdog still runs at
+    the idle FPS, and an unexpected gem-socket drop is treated as a crash
+    too). The try/finally clears the marker on exit so the phase re-navigation
+    that follows a lost state gets full-FPS inference.
     """
     _set_idle()
+    # Snapshot the gem link so we can tell "the console dropped while I was
+    # parked" (a strong game-crash signal) from a still-healthy link.
+    gem_gen = gem_server.generation()
+    gem_was_connected = gem_server.is_connected()
     try:
         while True:
             _wait_if_paused()
@@ -1140,6 +1069,18 @@ def process_code_queue():
                 if state and state[0] not in ('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 'SoftwareKeyboard'):
                     log.warning(f"Lost CodeBoxSelected while idling (now: {state[0]})")
                     return False
+                # A gem socket we'd established dropping out from under us
+                # almost always means the game crashed (gem aborts the
+                # socket on EXL_ABORT). Restart the whole stack from HOME —
+                # faster and more reliable than waiting for vision at 0.5fps
+                # to notice the crash screen.
+                if gem_was_connected and gem_server.generation() != gem_gen:
+                    log.error("Gem console dropped while parked — treating as crash")
+                    raise QuitAndRestart()
+                if not gem_was_connected and gem_server.is_connected():
+                    # Console connected after we parked; track it from here.
+                    gem_was_connected = True
+                    gem_gen = gem_server.generation()
                 # API handler may have pre-emptively cleared the marker on a
                 # put we haven't picked up yet, or on a manual GUI input. If
                 # the queue is genuinely empty and state is still neutral,
@@ -1148,9 +1089,7 @@ def process_code_queue():
                     _set_idle()
                 continue
 
-            # Got work — disable idle for the entire processing path.
-            _clear_idle()
-
+            # Got work — stay idled; we hand it to gem, not the keyboard.
             try:
                 api_result = _process_single_code(code, result_event, result_dict)
             except Exception:
@@ -1177,153 +1116,56 @@ def process_code_queue():
 
 
 def _process_single_code(code, result_event, result_dict):
-    """
-    Full replay code flow: type → submit → handle result → return to CodeBoxSelected.
-    Returns 'ok', 'duplicate', 'error_cleanup_done', or None (lost state).
-    For errors, notifies the client via result_event BEFORE cleanup.
-    """
-    # Pre-check: if replay already exists on Switch, skip the game entirely
-    if check_replay_exists(code):
-        log.info(f"Replay {code} already on Switch, fetching via FTP")
-        replay_data = fetch_replay_file(code)
-        result_dict['replay_data'] = replay_data
-        return 'duplicate'
+    """Hand one code to the gem worker and resolve the API request.
 
-    # Verify we're at code box
+    No typing, no in-game menu navigation, no FTP: gem drives the game's
+    own replay worker on the Switch and streams the bytes straight back.
+    We only sanity-check that the GUI is still parked at the code box (gem
+    needs the replay worker live, which it is on that screen) and then
+    submit. The gem client serializes so only one code is ever in flight.
+
+    Returns 'ok' on success or 'error_cleanup_done' on a clean failure
+    (game is fine, just report it). Returns None only if the state was
+    lost (caller re-navigates the phases). For every path the client is
+    notified via result_event before we return.
+    """
     state = read_state()
     if not state or state[0] not in ('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 'SoftwareKeyboard'):
         log.warning(f"Not at code entry state (at: {state[0] if state else 'None'})")
         return None
 
-    # Open keyboard if needed
-    if state[0] == 'ReplayMenuEntry_CodeEntry_CodeBoxSelected':
-        log.info(f"Opening keyboard for replay code: {code}")
-        send_action('ClickA')
-        if not wait_for_state('SoftwareKeyboard', 15):
-            log.warning("Keyboard didn't open")
-            return None
-
-    # Clear any leftover text and type the code in one command
-    log.info(f"Typing replay code: {code}")
-    send_action(f"clearAndType {code}")
-    time.sleep(1.5)
-
-    # Press Plus to submit (closes keyboard and submits text)
-    time.sleep(0.5)
-    send_action('ClickPlus')
-
-    # Expect OkHighlighted, or CodeBoxSelected if cursor landed there
-    result = wait_for_state(
-        ['ReplayMenuEntry_CodeEntry_OkBtnSelected', 'ReplayMenuEntry_CodeEntry_CodeBoxSelected'],
-        15
-    )
-    if not result:
-        log.warning("Didn't reach OK or CodeBox after Plus")
-        return None
-
-    if result == 'ReplayMenuEntry_CodeEntry_CodeBoxSelected':
-        # Cursor on code box, navigate down to OK
-        send_action('ClickDpadDown')
-        if not wait_for_state('ReplayMenuEntry_CodeEntry_OkBtnSelected', 10):
-            log.warning("Couldn't navigate to OK button")
-            return None
-
-    # Click A on OK button
-    log.info("Pressing A on OK")
-    send_action('ClickA')
-
-    # Wait for: confirmation screen, duplicate, or fetch error
-    result = wait_for_state(
-        ['ReplayMenuEntry_DownloadChoiceDialog_NoSelected',
-         'ReplayMenuEntry_DownloadChoiceDialog_YesSelected',
-         'ReplayMenuEntry_StatusDialog_Duplicate',
-         'ReplayMenuEntry_StatusDialog_FetchError'],
-        15
-    )
-    if not result:
-        log.warning("No response after clicking OK")
-        return None
-
-    # --- Duplicate ---
-    if result == 'ReplayMenuEntry_StatusDialog_Duplicate':
-        log.info("Duplicate replay code detected")
-        # Fetch replay file via FTP (it's already on the Switch)
-        replay_data = fetch_replay_file(code)
-        result_dict['replay_data'] = replay_data
-        # Notify client immediately, then clean up UI
-        result_dict['ok'] = True
+    log.info(f"Submitting replay code to gem worker: {code}")
+    try:
+        replay_data = gem_server.submit(code, timeout=GEM_SUBMIT_TIMEOUT)
+    except GemReplayError as e:
+        if e.error_type == ERR_BAD_REPLAY_CODE:
+            log.info(f"gem: bad replay code {code}")
+            result_dict['error_status'] = 404
+            result_dict['error'] = 'Bad replay code: replay not found'
+        else:
+            log.warning(f"gem: download failure for {code}")
+            result_dict['error_status'] = 500
+            result_dict['error'] = 'Replay download failed'
         result_event.set()
-
-        send_action('ClickA')  # dismiss dialog
-
-        # Duplicate returns to ReplaySelected (same as FetchOK)
-        if not wait_for_state('LobbyTmlHome_ReplaySelected', 15):
-            log.warning("Didn't return to ReplaySelected after Duplicate")
-            return None
-
-        # Navigate back into replay menu → CodeBoxSelected
-        send_action('ClickA')
-        if not wait_for_state('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 15):
-            log.warning("Didn't return to CodeBoxSelected")
-            return None
-
-        return 'duplicate'
-
-    # --- Fetch Error ---
-    if result == 'ReplayMenuEntry_StatusDialog_FetchError':
-        log.info("Fetch error detected")
-        # Notify client immediately before navigating back
-        result_dict['error'] = 'Fetch error from game'
+        return 'error_cleanup_done'
+    except GemNotConnected as e:
+        log.error(f"gem: console not connected ({e})")
+        result_dict['error_status'] = 500
+        result_dict['error'] = 'Gem console not connected'
         result_event.set()
-        send_action('ClickA')  # dismiss dialog
-        _return_to_codebox()
+        return 'error_cleanup_done'
+    except GemTimeout as e:
+        log.error(f"gem: {e}")
+        result_dict['error_status'] = 500
+        result_dict['error'] = 'Timed out waiting for gem worker'
+        result_event.set()
         return 'error_cleanup_done'
 
-    # --- Confirmation screen ---
-    if result == 'ReplayMenuEntry_DownloadChoiceDialog_NoSelected':
-        send_action('ClickDpadRight')
-        if not wait_for_state('ReplayMenuEntry_DownloadChoiceDialog_YesSelected', 10):
-            log.warning("Couldn't navigate to Yes")
-            return None
-
-    # At YesHighlighted — click A to start download
-    log.info("Confirming download")
-    send_action('ClickA')
-
-    # Wait for FetchOk
-    if not wait_for_state('ReplayMenuEntry_StatusDialog_FetchOK', 30):
-        log.warning("Didn't get FetchOk after confirming download")
-        return None
-
-    # Dismiss FetchOk
-    send_action('ClickA')
-
-    # Should return to ReplaySelected
-    if not wait_for_state('LobbyTmlHome_ReplaySelected', 15):
-        log.warning("Didn't return to ReplaySelected after FetchOk")
-        return None
-
-    # Fetch replay file via FTP
-    replay_data = fetch_replay_file(code)
+    log.info(f"gem: got {len(replay_data)} bytes for {code}")
     result_dict['replay_data'] = replay_data
-    # Notify client immediately, then clean up UI
     result_dict['ok'] = True
     result_event.set()
-
-    # Navigate back into replay menu → CodeBoxSelected
-    send_action('ClickA')
-    if not wait_for_state('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 15):
-        log.warning("Didn't return to CodeBoxSelected")
-        return None
-
     return 'ok'
-
-
-def _return_to_codebox():
-    """After dialog dismissal we land at OkBtnSelected. Navigate back up to CodeBoxSelected."""
-    wait_for_state('ReplayMenuEntry_CodeEntry_OkBtnSelected', 15)
-    send_action('ClickDpadUp')
-    wait_for_state('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 15)
 
 
 # --- Pause primitive ---
@@ -1435,22 +1277,20 @@ def _exit_stack(reason):
 # --- Main Loop ---
 
 def run_state_machine():
-    global _boot_splash_last
-
     log.info("State Machine starting")
     # Clear any stale markers from a previous run so vision starts at
     # full inference FPS during boot navigation phases.
     _clear_idle()
     _set_paused(False)
 
-    # Start HTTP API server in background thread
+    # Start the gem socket (the console dials out to us) and the HTTP API.
+    gem_server.start()
     api_thread = threading.Thread(target=start_api_server, daemon=True)
     api_thread.start()
 
     while True:
         try:
             _wait_if_paused()
-            _boot_splash_last = time.time()
 
             # Phase 1: HOME_BOOT
             if not phase_home_boot():

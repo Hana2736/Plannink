@@ -24,7 +24,7 @@ The secret is configured in `config.json` under `api_secret`.
 
 Fetch a Splatoon 3 replay file by its replay code. The request is queued and processed sequentially by the state machine — the connection blocks until the replay is fetched or an error occurs.
 
-If the replay already exists on the Switch, it is returned immediately via FTP without interacting with the game (~2s). Otherwise the state machine types the code into the game, waits for the download, then retrieves the file via FTP (~30s).
+The code is handed to the **gem worker** running inside the game on the Switch (over the gem socket), which drives the game's own replay worker and streams the file back. The GUI/state machine only navigates the player to the replay code box and keeps the game alive; codes are no longer typed in, and there is no FTP step. Codes are submitted strictly one at a time — the next is not sent to the worker until the current one has produced a response or failed.
 
 #### Request
 
@@ -47,11 +47,11 @@ Alternatively, the code can be sent as a plain text body.
 
 | Status | Content-Type | Body | Description |
 |---|---|---|---|
-| 200 | `application/octet-stream` | Raw `.rpl.zs` bytes | Replay fetched successfully (new or duplicate) |
+| 200 | `application/octet-stream` | Raw replay bytes | Replay fetched successfully |
 | 400 | text | `Invalid replay code: ...` | Code missing or invalid format (16 alphanumeric, starts with R) |
 | 401 | text | `Unauthorized` | Missing or invalid Bearer token |
-| 404 | text | `Not found` | Invalid endpoint |
-| 500 | text | Error message | Game fetch error, FTP failure, or state machine error |
+| 404 | text | `Bad replay code: replay not found` | Gem worker rejected the code — invalid / nonexistent replay (gem `BadReplayCode`). Also returned for the unknown `/endpoint` case with body `Not found`. |
+| 500 | text | Error message | Generic worker failure (gem `ReplayDownloadFailure`), console not connected, gem worker timeout, or state-machine timeout. The body text distinguishes the case. |
 
 #### Example
 
@@ -65,6 +65,11 @@ curl -X POST http://localhost:5003/replay \
 
 ## Notes
 
-- Requests are processed sequentially. If multiple requests are queued, each waits for the previous one to complete.
-- The connection stays open until the replay is fully processed. Expect beyond 30s for new replays, ~2s for duplicates.
-- The returned file is a Zstandard-compressed replay (`.rpl.zs`).
+- Requests are processed sequentially. If multiple requests are queued, each waits for the previous one to complete — exactly one code is ever in flight to the gem worker (sending a second while it is busy would crash the game).
+- The connection stays open until the replay is fully processed.
+- The returned bytes are the raw replay file as the game's replay worker produces it.
+- 404 (`Bad replay code: replay not found`) means the code itself is bad/nonexistent; a 500 means the worker, link, or state machine failed and the code may be worth retrying.
+
+## Gem socket
+
+The gem-injected game on the Switch is a TCP client that connects *out* to Plannink. Plannink listens on `gem.bind:gem.port` (default `0.0.0.0:6388`, also overridable via `PLANNINK_GEM_BIND` / `PLANNINK_GEM_PORT`). Point the console's `sd:/gem/config.txt` `server=`/`port=` at this host. Friend-playing notifications from gem are silently ignored. When gem reports an **uploaded replay** (`UploadReplayNotification`), the code is POSTed to the main app at `pool_ingest.url` (`https://hana.lol/inksight/pool_ingest_code` by default) with `Authorization: Bearer <pool_ingest.token>` and body `{"code": "R..."}`. Set the token in `config.json` under `pool_ingest.token` or via the `PLANNINK_POOL_INGEST_TOKEN` env var; if unset, codes are dropped with a warning. This forwarding is best-effort and never affects replay serving.

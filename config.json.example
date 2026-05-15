@@ -15,10 +15,7 @@
     "model_name": "spl3_everything_balanced.pkl",
     "switch": {
         "ip": "192.168.1.XXX",
-        "sysbot_port": 6000,
-        "ftp_port": 5000,
-        "ftp_user": "hana",
-        "ftp_pass": "password1234"
+        "sysbot_port": 6000
     },
     "server": {
         "control_port": 5002,
@@ -27,10 +24,16 @@
         "control_bind": "0.0.0.0",
         "api_bind": "0.0.0.0"
     },
-    "switch_paths": {
-        "replay_dir": "/atmosphere/saves/sysmmc/user/cache/0100c2500fc20000/00000000000000000000000000000000/0/replay/"
+    "gem": {
+        "bind": "0.0.0.0",
+        "port": 6388,
+        "submit_timeout": 90
     },
     "api_secret": "YOUR_SUPER_SECRET_TOKEN_HERE",
+    "pool_ingest": {
+        "url": "https://hana.lol/inksight/pool_ingest_code",
+        "token": "YOUR_POOL_INGEST_TOKEN_HERE"
+    },
     "capture": {
         "device_name": "UGREEN"
     }

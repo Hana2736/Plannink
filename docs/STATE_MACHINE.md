@@ -18,7 +18,7 @@ The system uses an **Agreement Period** of 3.0 seconds.
 ### 3. Watchdogs & Forced Recovery
 The system handles hangs via a `QuitAndRestart` exception:
 - **Error Watchdog**: If `SystemWindow` (Splatoon comm error / daychange popups) or `OSErr` (connection errors) are detected for >3s, the system raises the exception.
-- **Uptime Watchdog**: The system forces a restart if 6 hours pass without seeing the `BootSplash` to keep token fresh (pls dont ban me).
+- **Gem-drop Watchdog**: While parked at the code box, an unexpected drop of the gem socket is treated as a probable game crash and raises the exception.
 - **Recovery**: The exception is caught in the main loop, triggering `QuitGame` and a restart from Phase 1.
 
 ---
@@ -33,7 +33,7 @@ This section provides a definitive, state-centric list of every UI screen the AI
 
 #### `BootSplash`
 - **Description**: The initial loading screen when the game first launches.
-- **Usage**: This state is not actively sought. Its primary purpose is to reset the **Uptime Watchdog** timer. The machine forces a full restart if it goes 6 hours without seeing this state, preventing auth timeout.
+- **Usage**: This state is not actively sought and is not acted upon.
 
 #### `LoadingScreen`
 - **Description**: A generic loading screen that appears between different areas of the game.
@@ -127,38 +127,12 @@ This section provides a definitive, state-centric list of every UI screen the AI
 - **Action**: Triggers a `clickb_reset` to `LobbyVersus_LobbyAtTml` and retries the terminal interaction.
 
 #### `ReplayMenuEntry_CodeEntry_CodeBoxSelected`
-- **Description**: The "Enter Code" screen is open, and the cursor is on the text input box. This is the primary "ready" state for the API.
-- **Happy Path**: The machine idles in this state while waiting for API requests.
-- **Action**: Upon receiving a replay code, it sends `ClickA` to open the `SoftwareKeyboard`.
-- **Sad Path**: If the machine is in this state and idling, but the state unexpectedly changes, it assumes an error and re-initializes the lobby navigation sequence.
+- **Description**: The "Enter Code" screen is open, with the cursor on the text input box. This is the primary "ready" state and the end of GUI navigation.
+- **Happy Path**: The machine parks here and stays **idled** (vision drops to its low inference FPS) waiting for API requests. It does **not** type codes or touch the in-game replay menu any further.
+- **Action**: Upon receiving a code, it is handed to the **gem worker** on the Switch via the gem socket (`_process_single_code` → `gem_server.submit`). Gem drives the game's own replay worker and streams the raw replay bytes back; the state machine never leaves this screen for a normal request. Strictly one code is submitted at a time.
+  - Gem returns the replay → API client gets `200` + bytes.
+  - Gem returns `BadReplayCode` → API client gets `404` (`Bad replay code: replay not found`).
+  - Gem returns `ReplayDownloadFailure`, or the console isn't connected, or the worker times out → API client gets `500` with a describing message.
+- **Sad Path**: The AI is only un-idled if the game crashes. Two crash signals are watched while parked: the `SystemWindow`/`OSErr` watchdog (still running at the idle FPS), and an unexpected drop of the gem socket — either one forces a full restart from HOME so navigation re-runs at full FPS.
 
-#### `SoftwareKeyboard`
-- **Description**: The Switch's virtual keyboard is on-screen.
-- **Happy Path**: Seen after clicking on the code box.
-- **Action**: The machine sends the `clearAndType <code>` command, which erases the field and types the code. It then sends `ClickPlus` to submit.
-- **Sad Path**: If this state is not seen within 15 seconds of attempting to open it, the flow is aborted, and the terminal navigation is retried.
-
-#### `ReplayMenuEntry_CodeEntry_OkBtnSelected`
-- **Description**: The "Enter Code" screen where the on-screen "OK" button is highlighted.
-- **Happy Path**: This is the state after typing a code and pressing Plus.
-- **Action**: The machine sends `ClickA` to submit the code for validation.
-
-#### `ReplayMenuEntry_DownloadChoiceDialog_NoSelected` / `...YesSelected`
-- **Description**: The "Download this replay?" confirmation dialog.
-- **Happy Path**: This appears after submitting a valid, new replay code.
-- **Action**: If `NoSelected` is detected, it sends `ClickDpadRight` to move to "Yes". Once `YesSelected` is confirmed, it sends `ClickA` to begin the download.
-
-#### `ReplayMenuEntry_StatusDialog_FetchOK`
-- **Description**: A dialog confirming the replay was downloaded successfully.
-- **Happy Path**: The target state after confirming "Yes" to a download.
-- **Action**: The machine sends `ClickA` to dismiss the dialog. It then proceeds to fetch the file from the Switch via FTP.
-
-#### `ReplayMenuEntry_StatusDialog_Duplicate`
-- **Description**: A dialog indicating the user has already downloaded this replay.
-- **Sad Path Trigger**: This is a common, non-fatal error handled as part of the flow.
-- **Action**: It informs the API client, immediately fetches the existing replay via FTP, sends `ClickA` to dismiss the dialog, and navigates back to the code entry box.
-
-#### `ReplayMenuEntry_StatusDialog_FetchError`
-- **Description**: A dialog indicating the replay code is invalid or could not be found.
-- **Sad Path Trigger**: A fatal error for the given replay code.
-- **Action**: It informs the API client of the failure, sends `ClickA` to dismiss the dialog, and navigates back to the code entry box to await the next job.
+> The former in-game code-entry states (`SoftwareKeyboard`, `OkBtnSelected`, `DownloadChoiceDialog`, `StatusDialog_*`) are no longer driven by Plannink — gem handles the entire download inside the game. The vision model may still classify them, but the state machine no longer acts on them.
