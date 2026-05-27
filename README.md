@@ -1,5 +1,7 @@
 # Plannink: Autonomous Splatoon 3 Replay Fetcher
 
+> **You are on the `gem` branch.** This build uses the closed-source **gem** mod on the Switch to drive the game's own replay worker directly — no in-game typing, no FTP. If you don't have gem access, use the [`standalone`](https://github.com/Hana2736/Plannink/tree/standalone) branch, which fetches replays by typing codes in-game and pulling files via `sys-ftpd`.
+
 Plannink is a subproject of **[Inksight | Splatoon 3 Anticheat Analyzer](https://github.com/Hana2736/Inksight)**. It provides the automation infrastructure to load replay codes into the analyzer.
 
 Plannink is an AI-powered automation system for Nintendo Switch that autonomously navigates Splatoon 3 to fetch game replays via their 16-character codes. It uses computer vision (ResNet-34) to perceive game states and simulates controller inputs to interact with the console.
