@@ -22,7 +22,10 @@ On that single socket, packets are interleaved. Wire format
     UploadReplayNotification(4)  replay was uploaded   -> forward the code to
                                                           the on_replay_code
                                                           handler (off-thread)
-    FriendPlayingNotification(5) friend notification   -> read & discard
+    FriendPlayingNotification(5) friend playing event   -> forward the parsed
+                                                          (timestamp, nsa, subtype,
+                                                          match_mode, sender) to
+                                                          on_friend_playing (off-thread)
 
 Concurrency: gem refuses more than one replay at a time — sending a second
 ReplayReq while it is still working *crashes the game*. submit() therefore
@@ -48,9 +51,34 @@ PKT_FRIEND_NOTIFICATION = 5
 REPLAY_CODE_LENGTH = 16
 REPLAY_REQ_BODY_SIZE = REPLAY_CODE_LENGTH + 1  # char m_Code[17]
 
-# UploadReplayNotificationBody (protocol.hpp:52): u64 timestamp @0,
-# char m_Sender[23] @8, char m_ReplayCode[17] @31, total 48 bytes.
-UPLOAD_NOTIFICATION_CODE_OFFSET = 31
+# UploadReplayNotificationBody (protocol.hpp:57): u64 timestamp @0,
+# u64 m_NsaId @8, char m_Sender[23] @16, char m_ReplayCode[17] @39, total
+# 56 bytes. NSA ID and the NPLN ID (sender) are on the wire but Plannink
+# doesn't forward them anywhere — only the code is consumed.
+UPLOAD_NOTIFICATION_CODE_OFFSET = 39
+UPLOAD_NOTIFICATION_BODY_SIZE = 56
+
+# FriendPlayingNotificationBody (protocol.hpp:64): u64 timestamp @0,
+# u64 m_NsaId @8, u8 m_Subtype @16, u32 m_MatchMode @20 (3B pad in between),
+# char m_Sender[23] @24, total 48 bytes.
+NPLN_ID_LENGTH = 22
+FRIEND_NOTIFICATION_BODY_SIZE = 48
+FRIEND_NOTIFICATION_TIMESTAMP_OFFSET = 0
+FRIEND_NOTIFICATION_NSA_ID_OFFSET = 8
+FRIEND_NOTIFICATION_SUBTYPE_OFFSET = 16
+FRIEND_NOTIFICATION_MATCH_MODE_OFFSET = 20
+FRIEND_NOTIFICATION_SENDER_OFFSET = 24
+
+# FriendPlayingSubtype (protocol.hpp:28)
+FRIEND_SUBTYPE_START_SOLO = 0
+FRIEND_SUBTYPE_CREATE_ROOM = 1
+FRIEND_SUBTYPE_JOIN_ROOM = 2
+
+FRIEND_SUBTYPE_NAMES = {
+    FRIEND_SUBTYPE_START_SOLO: 'StartSolo',
+    FRIEND_SUBTYPE_CREATE_ROOM: 'CreateRoom',
+    FRIEND_SUBTYPE_JOIN_ROOM: 'JoinRoom',
+}
 
 # ErrorType (protocol.hpp:20)
 ERR_BAD_REPLAY_CODE = 0          # code invalid / replay does not exist
@@ -103,7 +131,7 @@ class GemServer:
     """Owns the listening socket, the (single) console connection, and the
     request/response handshake."""
 
-    def __init__(self, bind, port, log, on_replay_code=None):
+    def __init__(self, bind, port, log, on_replay_code=None, on_friend_playing=None):
         self._bind = bind
         self._port = port
         self._log = log
@@ -111,6 +139,10 @@ class GemServer:
         # UploadReplayNotification. Invoked on a throwaway daemon thread so a
         # slow handler can never stall the socket reader / heartbeats.
         self._on_replay_code = on_replay_code
+        # Called with (timestamp:int, nsa_id:int, subtype:int, match_mode:int,
+        # sender:str) for every FriendPlayingNotification. Same off-thread
+        # semantics as the replay callback.
+        self._on_friend_playing = on_friend_playing
 
         self._conn = None            # active console socket, or None
         self._send_lock = threading.Lock()   # serialize writes to the socket
@@ -207,7 +239,7 @@ class GemServer:
                 elif ptype == PKT_UPLOAD_NOTIFICATION:
                     self._handle_upload_notification(body)
                 elif ptype == PKT_FRIEND_NOTIFICATION:
-                    pass  # friend notifications: silently ignored
+                    self._handle_friend_notification(body)
                 else:
                     self._log.warning(f"Gem: ignoring unknown packet type {ptype} ({size}B)")
         except (ConnectionError, OSError) as e:
@@ -217,6 +249,11 @@ class GemServer:
         """Console pushed an UploadReplayNotification: pull the replay code
         out and forward it to the configured handler (off-thread)."""
         if self._on_replay_code is None:
+            return
+        if len(body) < UPLOAD_NOTIFICATION_BODY_SIZE:
+            self._log.warning(
+                f"Gem: upload notification body too short "
+                f"({len(body)} < {UPLOAD_NOTIFICATION_BODY_SIZE}); ignoring")
             return
         raw = body[UPLOAD_NOTIFICATION_CODE_OFFSET:
                     UPLOAD_NOTIFICATION_CODE_OFFSET + REPLAY_REQ_BODY_SIZE]
@@ -228,6 +265,39 @@ class GemServer:
         threading.Thread(
             target=self._on_replay_code, args=(code,),
             name='gem-ingest', daemon=True,
+        ).start()
+
+    def _handle_friend_notification(self, body):
+        """Console pushed a FriendPlayingNotification (a friend started a
+        solo / created or joined a room). Decode the body and forward the
+        structured event to the configured handler (off-thread)."""
+        if self._on_friend_playing is None:
+            return
+        if len(body) < FRIEND_NOTIFICATION_BODY_SIZE:
+            self._log.warning(
+                f"Gem: friend notification body too short "
+                f"({len(body)} < {FRIEND_NOTIFICATION_BODY_SIZE}); ignoring")
+            return
+        timestamp = int.from_bytes(
+            body[FRIEND_NOTIFICATION_TIMESTAMP_OFFSET:
+                 FRIEND_NOTIFICATION_TIMESTAMP_OFFSET + 8], 'little')
+        nsa_id = int.from_bytes(
+            body[FRIEND_NOTIFICATION_NSA_ID_OFFSET:
+                 FRIEND_NOTIFICATION_NSA_ID_OFFSET + 8], 'little')
+        subtype = body[FRIEND_NOTIFICATION_SUBTYPE_OFFSET]
+        match_mode = int.from_bytes(
+            body[FRIEND_NOTIFICATION_MATCH_MODE_OFFSET:
+                 FRIEND_NOTIFICATION_MATCH_MODE_OFFSET + 4], 'little')
+        sender_raw = body[FRIEND_NOTIFICATION_SENDER_OFFSET:
+                          FRIEND_NOTIFICATION_SENDER_OFFSET + NPLN_ID_LENGTH + 1]
+        sender = sender_raw.split(b'\x00', 1)[0].decode('ascii', 'ignore')
+        subtype_name = FRIEND_SUBTYPE_NAMES.get(subtype, f'Unknown({subtype})')
+        self._log.info(
+            f"Gem: friend playing {subtype_name} nsa={nsa_id:016x} sender={sender}")
+        threading.Thread(
+            target=self._on_friend_playing,
+            args=(timestamp, nsa_id, subtype, match_mode, sender),
+            name='gem-playing', daemon=True,
         ).start()
 
     def _deliver(self, data=None, err=None):

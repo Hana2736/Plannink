@@ -72,4 +72,19 @@ curl -X POST http://localhost:5003/replay \
 
 ## Gem socket
 
-The gem-injected game on the Switch is a TCP client that connects *out* to Plannink. Plannink listens on `gem.bind:gem.port` (default `0.0.0.0:6388`, also overridable via `PLANNINK_GEM_BIND` / `PLANNINK_GEM_PORT`). Point the console's `sd:/gem/config.txt` `server=`/`port=` at this host. Friend-playing notifications from gem are silently ignored. When gem reports an **uploaded replay** (`UploadReplayNotification`), the code is POSTed to the main app at `pool_ingest.url` (`https://hana.lol/inksight/pool_ingest_code` by default) with `Authorization: Bearer <pool_ingest.token>` and body `{"code": "R..."}`. Set the token in `config.json` under `pool_ingest.token` or via the `PLANNINK_POOL_INGEST_TOKEN` env var; if unset, codes are dropped with a warning. This forwarding is best-effort and never affects replay serving.
+The gem-injected game on the Switch is a TCP client that connects *out* to Plannink. Plannink listens on `gem.bind:gem.port` (default `0.0.0.0:6388`, also overridable via `PLANNINK_GEM_BIND` / `PLANNINK_GEM_PORT`). Point the console's `sd:/gem/config.txt` `server=`/`port=` at this host.
+
+Two kinds of upstream notification get forwarded to the main app — both POST with `Authorization: Bearer <pool_ingest.token>` (same token covers both). The token is set in `config.json` under `pool_ingest.token` or via the `PLANNINK_POOL_INGEST_TOKEN` env var; if unset, the corresponding payloads are dropped with a warning. Both forwarders are best-effort and never affect replay serving.
+
+- **`UploadReplayNotification`** → POST `pool_ingest.url` (default `https://hana.lol/inksight/pool_ingest_code`) with body `{"code": "R..."}`. The NSA ID and NPLN ID present in the wire packet are *not* forwarded on this endpoint.
+- **`FriendPlayingNotification`** → POST `pool_ingest.player_playing_update_url` (default `https://hana.lol/inksight/player_playing_update`) with body:
+  ```json
+  {
+    "timestamp":  1748390000,
+    "nsa_id":     "0462d0667a79aaa1",
+    "subtype":    "StartSolo",
+    "match_mode": 4,
+    "sender":     "u-apcykoaq5r2xbviomnmm"
+  }
+  ```
+  `subtype` is one of `StartSolo` / `CreateRoom` / `JoinRoom`; `nsa_id` is the sender's NSA ID as a 16-char zero-padded lowercase hex string; `sender` is the NPLN ID.

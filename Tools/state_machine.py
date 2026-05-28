@@ -16,7 +16,7 @@ from pathlib import Path
 from config_loader import load_config
 from gem_client import (
     GemServer, GemNotConnected, GemTimeout, GemReplayError,
-    ERR_BAD_REPLAY_CODE,
+    ERR_BAD_REPLAY_CODE, FRIEND_SUBTYPE_NAMES,
 )
 
 # --- Config ---
@@ -43,8 +43,12 @@ GEM_SUBMIT_TIMEOUT = int(config.get('gem', {}).get('submit_timeout', 90))
 
 # Pool ingest: when the console reports a freshly uploaded replay, push the
 # code up to the main app. Token can also come from PLANNINK_POOL_INGEST_TOKEN.
+# The same token covers both pool_ingest_code and player_playing_update.
 POOL_INGEST_URL = config.get('pool_ingest', {}).get(
     'url', 'https://hana.lol/inksight/pool_ingest_code')
+PLAYER_PLAYING_UPDATE_URL = config.get('pool_ingest', {}).get(
+    'player_playing_update_url',
+    'https://hana.lol/inksight/player_playing_update')
 POOL_INGEST_TOKEN = config.get('pool_ingest', {}).get('token', '')
 
 # Mirror the inference rates run_vision_ai.py uses, so /status can report
@@ -109,8 +113,46 @@ def _pool_ingest_code(code):
         log.error(f"Pool ingest: {code} failed: {e}")
 
 
+def _player_playing_update(timestamp, nsa_id, subtype, match_mode, sender):
+    """Forward a friend-playing notification (StartSolo / CreateRoom /
+    JoinRoom) to the main app.
+
+    Best-effort: runs on a gem-spawned daemon thread, never raises, and
+    never touches the queue or state machine.
+    """
+    if not POOL_INGEST_TOKEN:
+        log.warning(f"Player playing update: no token configured, dropping {sender}")
+        return
+    subtype_name = FRIEND_SUBTYPE_NAMES.get(subtype, str(subtype))
+    payload = json.dumps({
+        'timestamp':  timestamp,
+        'nsa_id':     f'{nsa_id:016x}',
+        'subtype':    subtype_name,
+        'match_mode': match_mode,
+        'sender':     sender,
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        PLAYER_PLAYING_UPDATE_URL, data=payload, method='POST',
+        headers={
+            'Authorization': f'Bearer {POOL_INGEST_TOKEN}',
+            'Content-Type': 'application/json',
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            log.info(f"Player playing update: {sender} {subtype_name} -> HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        log.error(f"Player playing update: {sender} -> HTTP {e.code} {e.reason}")
+    except (urllib.error.URLError, OSError) as e:
+        log.error(f"Player playing update: {sender} failed: {e}")
+
+
 # We are the server; the console (gem-injected game) connects out to us.
-gem_server = GemServer(GEM_BIND, GEM_PORT, log, on_replay_code=_pool_ingest_code)
+gem_server = GemServer(
+    GEM_BIND, GEM_PORT, log,
+    on_replay_code=_pool_ingest_code,
+    on_friend_playing=_player_playing_update,
+)
 
 # --- HTTP API ---
 
