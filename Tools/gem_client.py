@@ -11,8 +11,14 @@ On that single socket, packets are interleaved. Wire format
     PacketHeader  : 4 bytes  -> type:u8, size:u24 little-endian
     <body>        : `size` bytes
 
-    Heartbeat(0)                 keepalive            -> read & discard (gem
-                                                         does not expect a reply)
+    Heartbeat(0)                 keepalive ping/pong   -> outbound thread sends
+                                                          Heartbeat(magic=N), gem
+                                                          echoes back with magic=N+1.
+                                                          Used purely to keep the
+                                                          socket (and any NAT/firewall
+                                                          state on the path) warm; a
+                                                          missed echo tears the
+                                                          connection down.
     ReplayReq(1)                 we send this         -> 17-byte body: 16-char
                                                          code + NUL
     ReplayResp(2)                success              -> body is raw replay bytes
@@ -37,6 +43,7 @@ codes one at a time.
 import socket
 import struct
 import threading
+import time
 
 
 # --- Protocol constants ---
@@ -79,6 +86,22 @@ FRIEND_SUBTYPE_NAMES = {
     FRIEND_SUBTYPE_CREATE_ROOM: 'CreateRoom',
     FRIEND_SUBTYPE_JOIN_ROOM: 'JoinRoom',
 }
+
+# Heartbeat keepalive: outbound thread per connection sends Heartbeat,
+# waits for the echo, then sleeps. Gem's response is essentially instant
+# *when its main loop is reading*, so a missed echo within
+# HEARTBEAT_REPLY_TIMEOUT is treated as a dead link.
+#
+# Heartbeats are gated on `_pending is None` — i.e., we only fire when no
+# ReplayReq is in flight. Gem's main loop is single-threaded, and while it
+# is doing comms::SendBody for a large ReplayResp it isn't reading the
+# socket, so a heartbeat sent during that window can time out spuriously
+# and tear down a healthy connection mid-transfer. The active transfer is
+# already keeping the link warm; heartbeats are only useful when idle.
+HEARTBEAT_BODY_SIZE = 4
+HEARTBEAT_INTERVAL = 10        # seconds to sleep between cycles, post-reply
+HEARTBEAT_REPLY_TIMEOUT = 5    # seconds to wait for gem to echo before dropping
+HEARTBEAT_BUSY_POLL = 1        # while a ReplayReq is in flight, re-check this often
 
 # ErrorType (protocol.hpp:20)
 ERR_BAD_REPLAY_CODE = 0          # code invalid / replay does not exist
@@ -159,6 +182,14 @@ class GemServer:
         self._generation = 0
         self._connected = False
 
+        # Heartbeat ping/pong synchronization. The reader thread sets
+        # `_heartbeat_reply` whenever an inbound Heartbeat arrives; the
+        # per-connection heartbeat thread waits on it. `_heartbeat_seq`
+        # is a wrap-around counter we put in m_Magic so logs can correlate
+        # send/receive even though we don't validate the echo value.
+        self._heartbeat_reply = threading.Event()
+        self._heartbeat_seq = 0
+
     # ----- lifecycle -----
 
     def start(self):
@@ -186,6 +217,10 @@ class GemServer:
                 self._conn = conn
                 self._connected = True
                 self._generation += 1
+            threading.Thread(
+                target=self._heartbeat_loop, args=(conn,),
+                name='gem-heartbeat', daemon=True,
+            ).start()
             self._reader_loop(conn)
 
     def _drop_connection(self, reason):
@@ -235,7 +270,10 @@ class GemServer:
                 # aligned, then handle/ignore it.
                 body = _recv_exact(conn, size) if size else b''
                 if ptype == PKT_HEARTBEAT:
-                    pass  # gem does not expect a reply
+                    # Echo of a heartbeat we sent — wake the heartbeat thread.
+                    # We don't validate body.m_Magic; gem always echoes
+                    # (magic+1) and we only care that *something* came back.
+                    self._heartbeat_reply.set()
                 elif ptype == PKT_UPLOAD_NOTIFICATION:
                     self._handle_upload_notification(body)
                 elif ptype == PKT_FRIEND_NOTIFICATION:
@@ -299,6 +337,50 @@ class GemServer:
             args=(timestamp, nsa_id, subtype, match_mode, sender),
             name='gem-playing', daemon=True,
         ).start()
+
+    def _heartbeat_loop(self, conn):
+        """Per-connection ping thread: send Heartbeat → wait for the echo →
+        sleep → repeat. A missed echo means the link is dead (gem replies
+        in microseconds when it's alive *and* its recv loop is running), so
+        we tear the connection down and let the accept loop pick up the
+        next one.
+
+        Gated on `_pending is None`: while a ReplayReq is in flight, gem
+        may be busy in SendBody for the (potentially large) ReplayResp and
+        won't read incoming heartbeats — sending one would false-timeout
+        and kill a healthy transfer. The active transfer keeps the socket
+        warm, so suppressing heartbeats during it is safe."""
+        while True:
+            # Bail if a newer connection has superseded ours.
+            if self._conn is not conn:
+                return
+            # If a replay request is in flight, skip this cycle — see the
+            # module-level comment on HEARTBEAT_BUSY_POLL for why.
+            with self._state_lock:
+                busy = self._pending is not None
+            if busy:
+                time.sleep(HEARTBEAT_BUSY_POLL)
+                continue
+            self._heartbeat_reply.clear()
+            magic = self._heartbeat_seq & 0xFFFFFFFF
+            self._heartbeat_seq = (self._heartbeat_seq + 1) & 0xFFFFFFFF
+            body = magic.to_bytes(4, 'little')
+            header = bytes([PKT_HEARTBEAT]) + \
+                HEARTBEAT_BODY_SIZE.to_bytes(3, 'little')
+            try:
+                with self._send_lock:
+                    conn.sendall(header + body)
+            except OSError as e:
+                self._log.info(
+                    f"Gem heartbeat: send failed ({e}); thread exiting")
+                return
+            if not self._heartbeat_reply.wait(timeout=HEARTBEAT_REPLY_TIMEOUT):
+                self._log.warning(
+                    f"Gem heartbeat: no echo within {HEARTBEAT_REPLY_TIMEOUT}s; "
+                    f"dropping connection")
+                self._drop_connection('heartbeat reply timeout')
+                return
+            time.sleep(HEARTBEAT_INTERVAL)
 
     def _deliver(self, data=None, err=None):
         """Hand a result to the waiting submit(), if any."""
