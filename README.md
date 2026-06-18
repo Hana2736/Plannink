@@ -12,7 +12,7 @@ The system consists of three main components working in tandem:
 
 1.  **Vision AI (`run_vision_ai.py`)**: Captures 1080p60 video from a capture card, runs a ResNet-34 classifier to identify the current game screen, and writes the state to shared memory.
 2.  **Control Backend (`control_backend.py`)**: Connects to the Switch (via `sys-botbase`) and provides a local socket API to execute button presses, stick movements, and HID keyboard strings.
-3.  **State Machine (`state_machine.py`)**: The "brain" that reads AI states, handles the complex navigation logic, manages a replay code queue, exposes a REST API for external requests, and bridges those requests to the **gem worker** running inside the game on the Switch. Plannink walks the player to the replay code box; codes are then fetched by gem (no typing, no FTP).
+3.  **State Machine (`state_machine.py`)**: The "brain" that reads AI states, handles the lobby navigation logic, manages a replay code queue, exposes a REST API for external requests, and bridges those requests to the **gem worker** running inside the game on the Switch. Plannink walks the player to the lobby terminal and parks there; codes are then fetched by gem (no typing, no menu navigation, no FTP).
 
 ## 🛠️ Requirements
 

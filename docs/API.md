@@ -24,7 +24,7 @@ The secret is configured in `config.json` under `api_secret`.
 
 Fetch a Splatoon 3 replay file by its replay code. The request is queued and processed sequentially by the state machine — the connection blocks until the replay is fetched or an error occurs.
 
-The code is handed to the **gem worker** running inside the game on the Switch (over the gem socket), which drives the game's own replay worker and streams the file back. The GUI/state machine only navigates the player to the replay code box and keeps the game alive; codes are no longer typed in, and there is no FTP step. Codes are submitted strictly one at a time — the next is not sent to the worker until the current one has produced a response or failed.
+The code is handed to the **gem worker** running inside the game on the Switch (over the gem socket), which drives the game's own replay worker and streams the file back. The GUI/state machine only walks the player to the lobby terminal and keeps the game alive there; codes are no longer typed in, there is no terminal-menu navigation, and there is no FTP step. Codes are submitted strictly one at a time — the next is not sent to the worker until the current one has produced a response or failed.
 
 #### Request
 

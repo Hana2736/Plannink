@@ -18,7 +18,7 @@ The system uses an **Agreement Period** of 3.0 seconds.
 ### 3. Watchdogs & Forced Recovery
 The system handles hangs via a `QuitAndRestart` exception:
 - **Error Watchdog**: If `SystemWindow` (Splatoon comm error / daychange popups) or `OSErr` (connection errors) are detected for >3s, the system raises the exception.
-- **Gem-drop Watchdog**: While parked at the code box, an unexpected drop of the gem socket is treated as a probable game crash and raises the exception.
+- **Gem-drop Watchdog**: While parked at the lobby terminal, an unexpected drop of the gem socket is treated as a probable game crash and raises the exception.
 - **Recovery**: The exception is caught in the main loop, triggering `QuitGame` and a restart from Phase 1.
 
 ---
@@ -102,37 +102,16 @@ This section provides a definitive, state-centric list of every UI screen the AI
 - **Sad Path**: If this state is still active *after* the `WalkToLobbyTml` macro has finished, the machine assumes the character is stuck. It recovers by exiting the lobby and returning to `FreeRoam`, then retrying the entire lobby entry and walk sequence.
 
 ---
-### **Phase 6-9: Terminal & Replay Code Flow**
+### **Phase 6: Park at Terminal & Serve Codes**
 ---
 
 #### `LobbyVersus_LobbyAtTml`
 - **Description**: The player is standing in the correct position in front of the lobby terminal.
-- **Happy Path**: This is the target state after the `WalkToLobbyTml` action. It is also the recovery state for most terminal menu errors.
-- **Action**: The machine sends `ClickA` to open the terminal menu.
-
-#### `LobbyTmlHome_GetStuffSelected`
-- **Description**: The terminal menu is open, and the cursor is on the default "Get Stuff" tab.
-- **Happy Path**: The expected state after pressing 'A' at the terminal.
-- **Action**: The machine sends `ClickDpadRight` three times to navigate to the Replay tab.
-- **Sad Path**: If this state is seen when the machine expects to be on the Replay tab (`LobbyTmlHome_ReplaySelected`), it triggers a `clickb_reset` and retries the terminal navigation from `LobbyVersus_LobbyAtTml`.
-
-#### `LobbyTmlHome_ReplaySelected`
-- **Description**: The terminal menu is open, and the cursor is on the "Replays" tab.
-- **Happy Path**: The target state after navigating right from "Get Stuff".
-- **Action**: The machine sends `ClickA` to enter the replay menu. It also waits for this state after successfully downloading or dismissing a duplicate replay dialog.
-
-#### `LobbyTmlHome_BadSelection`
-- **Description**: A catch-all for when the terminal menu is open but on an unexpected tab.
-- **Sad Path Trigger**: Seen at any point during terminal navigation.
-- **Action**: Triggers a `clickb_reset` to `LobbyVersus_LobbyAtTml` and retries the terminal interaction.
-
-#### `ReplayMenuEntry_CodeEntry_CodeBoxSelected`
-- **Description**: The "Enter Code" screen is open, with the cursor on the text input box. This is the primary "ready" state and the end of GUI navigation.
-- **Happy Path**: The machine parks here and stays **idled** (vision drops to its low inference FPS) waiting for API requests. It does **not** type codes or touch the in-game replay menu any further.
+- **Happy Path**: This is the **target/parked "ready" state** and the end of GUI navigation. After the `WalkToLobbyTml` action lands here, the machine stays **idled** (vision drops to its low inference FPS) and waits for API requests. With gem driving the game's replay worker directly, there is **no reason to open the terminal menu or navigate to a code box** — the terminal is simply a stable, online, in-lobby spot to park. The machine does **not** send `ClickA` or any further navigation here.
 - **Action**: Upon receiving a code, it is handed to the **gem worker** on the Switch via the gem socket (`_process_single_code` → `gem_server.submit`). Gem drives the game's own replay worker and streams the raw replay bytes back; the state machine never leaves this screen for a normal request. Strictly one code is submitted at a time.
   - Gem returns the replay → API client gets `200` + bytes.
   - Gem returns `BadReplayCode` → API client gets `404` (`Bad replay code: replay not found`).
   - Gem returns `ReplayDownloadFailure`, or the console isn't connected, or the worker times out → API client gets `500` with a describing message.
-- **Sad Path**: The AI is only un-idled if the game crashes. Two crash signals are watched while parked: the `SystemWindow`/`OSErr` watchdog (still running at the idle FPS), and an unexpected drop of the gem socket — either one forces a full restart from HOME so navigation re-runs at full FPS.
+- **Sad Path**: The AI is only un-idled if the parked state is lost. Two crash signals are watched while parked: the `SystemWindow`/`OSErr` watchdog (still running at the idle FPS), and an unexpected drop of the gem socket. Losing `LobbyVersus_LobbyAtTml` for any reason (drift, popup, crash) forces a **full restart from HOME** so navigation re-runs at full FPS.
 
-> The former in-game code-entry states (`SoftwareKeyboard`, `OkBtnSelected`, `DownloadChoiceDialog`, `StatusDialog_*`) are no longer driven by Plannink — gem handles the entire download inside the game. The vision model may still classify them, but the state machine no longer acts on them.
+> The former in-game terminal/replay-menu states (`LobbyTmlHome_*`, `ReplayMenuEntry_CodeEntry_CodeBoxSelected`, `SoftwareKeyboard`, `OkBtnSelected`, `DownloadChoiceDialog`, `StatusDialog_*`) are no longer driven by Plannink — the bot parks at the terminal and gem handles the entire download inside the game. The vision model may still classify these screens, but the state machine no longer navigates to or acts on them.

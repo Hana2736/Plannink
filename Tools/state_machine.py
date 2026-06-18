@@ -61,8 +61,8 @@ FRAME_JPEG_PATH = '/dev/shm/frame.jpg'
 
 # Inference-throttle handshake with run_vision_ai. While this file exists,
 # vision drops to its idle FPS (0.5 fps by default). The state machine sets
-# it whenever process_code_queue is parked at CodeBoxSelected with no work,
-# and clears it the moment a code arrives or any phase function takes over.
+# it whenever process_code_queue is parked at the lobby terminal with no
+# work, and clears it the moment a code arrives or any phase function takes over.
 IDLE_MARKER_PATH = '/dev/shm/plannink_idle'
 
 # Pause handshake. While this file exists, vision skips the model call (no
@@ -1008,90 +1008,16 @@ def phase_walk_to_tml():
     return False
 
 
-def phase_tml_menu():
-    """Phase 6: Interact with terminal menu."""
-    log.info("=== Phase 6: TML_MENU ===")
-    deadline = time.time() + 300
-
-    while time.time() < deadline:
-        _check_watchdog()
-
-        # Press A to interact
-        send_action('ClickA')
-        result = wait_for_state(
-            ['LobbyTmlHome_GetStuffSelected', 'LobbyTmlHome_BadSelection'],
-            15
-        )
-
-        if result == 'LobbyTmlHome_GetStuffSelected':
-            return True
-
-        if result == 'LobbyTmlHome_BadSelection':
-            log.info("TML bad selection, backing out")
-            r = clickb_reset('LobbyVersus_LobbyAtTml', 15)
-            if not r:
-                return False
-            continue
-
-        # Check if we're still at TML
-        state = read_state()
-        if state and state[0] == 'LobbyVersus_LobbyAtTml':
-            continue
-
-        log.warning("Lost TML state")
-        return False
-
-    log.warning("Phase TML_MENU timed out")
-    return False
-
-
-def phase_nav_replay():
-    """Phase 7: Navigate to Replay option using DpadRight."""
-    log.info("=== Phase 7: NAV_REPLAY ===")
-    send_action_repeated('ClickDpadRight', 3, 0.5)
-
-    result = wait_for_state(
-        ['LobbyTmlHome_ReplaySelected', 'LobbyTmlHome_GetStuffSelected', 'LobbyTmlHome_BadSelection'],
-        10
-    )
-
-    if result == 'LobbyTmlHome_ReplaySelected':
-        return True
-
-    if result in ('LobbyTmlHome_GetStuffSelected', 'LobbyTmlHome_BadSelection'):
-        log.info("Nav to Replay failed, backing out to TML")
-        clickb_reset('LobbyVersus_LobbyAtTml', 15)
-        return None  # Signal retry from phase 6
-
-    log.warning("Nav to Replay: unexpected state")
-    clickb_reset('LobbyVersus_LobbyAtTml', 15)
-    return None
-
-
-def phase_code_entry():
-    """Phase 8: Select code entry box."""
-    log.info("=== Phase 8: CODE_ENTRY ===")
-    send_action('ClickA')
-
-    result = wait_for_state('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 15)
-    if result:
-        return True
-
-    log.warning("Code entry not reached, backing out")
-    clickb_reset('LobbyVersus_LobbyAtTml', 15)
-    return None  # Signal retry from phase 6
-
-
 def process_code_queue():
-    """Wait at CodeBoxSelected for codes from the API, hand each to the gem
-    worker, return the result. Returns False if state is lost.
+    """Wait at the lobby terminal for codes from the API, hand each to the
+    gem worker, return the result. Returns False if state is lost.
 
-    Once parked here the AI stays idled the whole time: we hand codes
-    straight to the gem worker instead of typing them, so vision is only
-    needed to notice a crash (the SystemWindow/OSErr watchdog still runs at
-    the idle FPS, and an unexpected gem-socket drop is treated as a crash
-    too). The try/finally clears the marker on exit so the phase re-navigation
-    that follows a lost state gets full-FPS inference.
+    Once parked here the AI stays idled the whole time: gem drives the
+    game's replay worker directly, so vision is only needed to notice a
+    crash (the SystemWindow/OSErr watchdog still runs at the idle FPS, and
+    an unexpected gem-socket drop is treated as a crash too). The
+    try/finally clears the marker on exit so the restart that follows a
+    lost state gets full-FPS inference.
     """
     _set_idle()
     # Snapshot the gem link so we can tell "the console dropped while I was
@@ -1108,8 +1034,8 @@ def process_code_queue():
             except queue.Empty:
                 # Verify we're still at code box while idling
                 state = read_state()
-                if state and state[0] not in ('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 'SoftwareKeyboard'):
-                    log.warning(f"Lost CodeBoxSelected while idling (now: {state[0]})")
+                if state and state[0] != 'LobbyVersus_LobbyAtTml':
+                    log.warning(f"Lost lobby terminal while idling (now: {state[0]})")
                     return False
                 # A gem socket we'd established dropping out from under us
                 # almost always means the game crashed (gem aborts the
@@ -1162,18 +1088,18 @@ def _process_single_code(code, result_event, result_dict):
 
     No typing, no in-game menu navigation, no FTP: gem drives the game's
     own replay worker on the Switch and streams the bytes straight back.
-    We only sanity-check that the GUI is still parked at the code box (gem
-    needs the replay worker live, which it is on that screen) and then
-    submit. The gem client serializes so only one code is ever in flight.
+    We only sanity-check that the bot is still parked at the lobby terminal
+    (a stable, online, in-lobby state where the replay worker is live) and
+    then submit. The gem client serializes so only one code is ever in flight.
 
     Returns 'ok' on success or 'error_cleanup_done' on a clean failure
     (game is fine, just report it). Returns None only if the state was
-    lost (caller re-navigates the phases). For every path the client is
+    lost (caller restarts from HOME). For every path the client is
     notified via result_event before we return.
     """
     state = read_state()
-    if not state or state[0] not in ('ReplayMenuEntry_CodeEntry_CodeBoxSelected', 'SoftwareKeyboard'):
-        log.warning(f"Not at code entry state (at: {state[0] if state else 'None'})")
+    if not state or state[0] != 'LobbyVersus_LobbyAtTml':
+        log.warning(f"Not at lobby terminal (at: {state[0] if state else 'None'})")
         return None
 
     log.info(f"Submitting replay code to gem worker: {code}")
@@ -1367,32 +1293,16 @@ def run_state_machine():
                 quit_game_and_wait()
                 continue
 
-            # Phases 6-9: TML_MENU → NAV_REPLAY → CODE_ENTRY → KEYBOARD
-            while True:
-                result6 = phase_tml_menu()
-                if not result6:
-                    break
+            # SUCCESS — standing at the lobby terminal (LobbyVersus_LobbyAtTml).
+            # With gem we drive the game's replay worker directly, so there's
+            # no reason to open the terminal menu or walk to the code box: the
+            # terminal is the parked "ready" state. We serve API codes from here.
+            log.info("=== AT LOBBY TERMINAL — READY FOR CODES ===")
 
-                result7 = phase_nav_replay()
-                if result7 is None:
-                    continue  # retry from phase 6
-                if not result7:
-                    break
-
-                result8 = phase_code_entry()
-                if result8 is None:
-                    continue  # retry from phase 6
-                if not result8:
-                    break
-
-                # SUCCESS — sitting at CodeBoxSelected
-                log.info("=== AT CODE ENTRY BOX — READY FOR CODES ===")
-
-                # Process replay codes from the API queue
-                if process_code_queue() is False:
-                    # Lost state, retry from phase 6
-                    continue
-
+            # process_code_queue parks until it loses the state (returns False)
+            # or detects a crash (raises QuitAndRestart). Either way we fall
+            # through to a full restart from HOME.
+            process_code_queue()
             quit_game_and_wait()
 
         except QuitAndRestart:
