@@ -212,30 +212,41 @@ def _health_ping_loop():
     """Heartbeat the main app every HEALTH_PING_INTERVAL seconds.
 
     Best-effort and self-contained: never touches the queue or state
-    machine, and only logs on a state transition (so it's not 60s INFO
-    spam). A skip — None state — is intentional silence, not an error.
+    machine. Logging is deduped so a steady state is quiet — we log on a
+    reported-state transition, log a POST failure once (and again only if
+    the failure changes), and log a single "recovered" when pings start
+    succeeding again. A skip — None state — is intentional silence.
     """
     if not POOL_INGEST_TOKEN:
         log.warning("Health check: no POOL_INGEST_TOKEN configured; health pings disabled")
         return
-    last = object()  # sentinel: first computed state always logs
+    last_state = object()  # sentinel: first computed state always logs
+    last_error = None      # last POST failure signature; None == last ping ok
     while True:
         try:
             state = _compute_health_state()
-            if state != last:
-                if state is None:
-                    log.info("Health: going silent (gem down / error / HOME)")
-                else:
-                    log.info(f"Health: reporting '{state}'")
-                last = state
+            if state != last_state:
+                log.info("Health: going silent (gem down / error / HOME)"
+                         if state is None else f"Health: reporting '{state}'")
+                last_state = state
             if state is not None:
-                _post_health(state)
-        except urllib.error.HTTPError as e:
-            log.warning(f"Health ping -> HTTP {e.code} {e.reason}")
-        except (urllib.error.URLError, OSError) as e:
-            log.warning(f"Health ping failed: {e}")
+                try:
+                    _post_health(state)
+                    if last_error is not None:
+                        log.info("Health ping recovered")
+                        last_error = None
+                except urllib.error.HTTPError as e:
+                    err = f"HTTP {e.code} {e.reason}"
+                    if err != last_error:
+                        log.warning(f"Health ping -> {err}")
+                    last_error = err
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                    if err != last_error:
+                        log.warning(f"Health ping failed: {err}")
+                    last_error = err
         except Exception as e:
-            log.warning(f"Health ping error: {e}")
+            log.warning(f"Health loop error: {e}")
         time.sleep(HEALTH_PING_INTERVAL)
 
 
