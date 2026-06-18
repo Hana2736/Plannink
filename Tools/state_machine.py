@@ -49,7 +49,22 @@ POOL_INGEST_URL = config.get('pool_ingest', {}).get(
 PLAYER_PLAYING_UPDATE_URL = config.get('pool_ingest', {}).get(
     'player_playing_update_url',
     'https://hana.lol/inksight/player_playing_update')
+CLOUDFETCH_HEALTH_URL = config.get('pool_ingest', {}).get(
+    'cloudfetch_health_url',
+    'https://hana.lol/inksight/cloudfetch_health')
 POOL_INGEST_TOKEN = config.get('pool_ingest', {}).get('token', '')
+
+# Health heartbeat: ping the main app every HEALTH_PING_INTERVAL seconds with
+# our current readiness. The main app flags the fetcher "crashed" if it sees
+# no successful ping for >90s, so the interval must stay comfortably under that.
+HEALTH_PING_INTERVAL = 60   # seconds between pings
+HEALTH_PING_TIMEOUT = 5     # per-request timeout
+HEALTH_READY_STATE = 'LobbyVersus_LobbyAtTml'   # parked + serving == ready
+# States that suppress the ping entirely. We deliberately go silent (rather
+# than report a state) when the bot can't serve — the main app's >90s timeout
+# then surfaces it as down/crashed, which is the signal we want.
+HEALTH_SKIP_LABELS = ('OSErr', 'SystemWindow')
+HEALTH_SKIP_PREFIXES = ('HOMEMenu',)
 
 # Mirror the inference rates run_vision_ai.py uses, so /status can report
 # the right number to the GUI without a second source of truth.
@@ -153,6 +168,76 @@ gem_server = GemServer(
     on_replay_code=_pool_ingest_code,
     on_friend_playing=_player_playing_update,
 )
+
+
+# --- Health heartbeat ---
+
+def _compute_health_state():
+    """Decide what to report to the health endpoint this tick.
+
+    Returns 'ready', 'loading', or None (send nothing):
+      - gem not connected               -> None  (can't serve; looks down)
+      - OSErr / SystemWindow / HOMEMenu -> None  (errored / quit; looks down)
+      - parked at the lobby terminal    -> 'ready'
+      - anything else (boot + lobby nav)-> 'loading'
+    """
+    if not gem_server.is_connected():
+        return None
+    state = read_state()
+    if not state:
+        return None
+    label = state[0]
+    if label in HEALTH_SKIP_LABELS or label.startswith(HEALTH_SKIP_PREFIXES):
+        return None
+    if label == HEALTH_READY_STATE:
+        return 'ready'
+    return 'loading'
+
+
+def _post_health(state):
+    """POST a single health heartbeat. Raises on failure (caller logs)."""
+    payload = json.dumps({'state': state}).encode('utf-8')
+    req = urllib.request.Request(
+        CLOUDFETCH_HEALTH_URL, data=payload, method='POST',
+        headers={
+            'Authorization': f'Bearer {POOL_INGEST_TOKEN}',
+            'Content-Type': 'application/json',
+        },
+    )
+    with urllib.request.urlopen(req, timeout=HEALTH_PING_TIMEOUT) as resp:
+        resp.read()
+
+
+def _health_ping_loop():
+    """Heartbeat the main app every HEALTH_PING_INTERVAL seconds.
+
+    Best-effort and self-contained: never touches the queue or state
+    machine, and only logs on a state transition (so it's not 60s INFO
+    spam). A skip — None state — is intentional silence, not an error.
+    """
+    if not POOL_INGEST_TOKEN:
+        log.warning("Health check: no POOL_INGEST_TOKEN configured; health pings disabled")
+        return
+    last = object()  # sentinel: first computed state always logs
+    while True:
+        try:
+            state = _compute_health_state()
+            if state != last:
+                if state is None:
+                    log.info("Health: going silent (gem down / error / HOME)")
+                else:
+                    log.info(f"Health: reporting '{state}'")
+                last = state
+            if state is not None:
+                _post_health(state)
+        except urllib.error.HTTPError as e:
+            log.warning(f"Health ping -> HTTP {e.code} {e.reason}")
+        except (urllib.error.URLError, OSError) as e:
+            log.warning(f"Health ping failed: {e}")
+        except Exception as e:
+            log.warning(f"Health ping error: {e}")
+        time.sleep(HEALTH_PING_INTERVAL)
+
 
 # --- HTTP API ---
 
@@ -1255,6 +1340,10 @@ def run_state_machine():
     gem_server.start()
     api_thread = threading.Thread(target=start_api_server, daemon=True)
     api_thread.start()
+    # Heartbeat our readiness up to the main app every 60s.
+    health_thread = threading.Thread(
+        target=_health_ping_loop, name='health-ping', daemon=True)
+    health_thread.start()
 
     while True:
         try:

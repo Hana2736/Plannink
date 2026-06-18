@@ -88,3 +88,18 @@ Two kinds of upstream notification get forwarded to the main app — both POST w
   }
   ```
   `subtype` is one of `StartSolo` / `CreateRoom` / `JoinRoom`; `nsa_id` is the sender's NSA ID as a 16-char zero-padded lowercase hex string; `sender` is the NPLN ID.
+
+## Health heartbeat
+
+A background thread POSTs the bot's readiness to `pool_ingest.cloudfetch_health_url` (default `https://hana.lol/inksight/cloudfetch_health`) every 60 seconds, using the same `Authorization: Bearer <pool_ingest.token>`. Body is `{"state": "ready"}` or `{"state": "loading"}`. The main app flags the fetcher **crashed** if it sees no successful ping for >90s.
+
+What gets reported each tick is derived from the gem link and the current vision state:
+
+| Condition | Reported |
+|---|---|
+| Parked at the lobby terminal (`LobbyVersus_LobbyAtTml`), gem connected | `ready` |
+| Booting / navigating to the lobby (`BootSplash`, `LoadingScreen`, title, news, freeroam, lobby nav, …) | `loading` |
+| Gem not connected | *(no ping)* |
+| Error popup (`OSErr`, `SystemWindow`) or Switch HOME menu (`HOMEMenu*`) | *(no ping)* |
+
+The "no ping" cases are intentional silence: if the bot can't serve, we let the main app's >90s timeout surface it as down rather than reporting a misleading state. The ping is best-effort and never affects replay serving. If `pool_ingest.token` is unset, the heartbeat is disabled (logged once at startup).

@@ -33,6 +33,7 @@
     "pool_ingest": {
         "url": "https://hana.lol/inksight/pool_ingest_code",
         "player_playing_update_url": "https://hana.lol/inksight/player_playing_update",
+        "cloudfetch_health_url": "https://hana.lol/inksight/cloudfetch_health",
         "token": "YOUR_POOL_INGEST_TOKEN_HERE"
     },
     "capture": {
