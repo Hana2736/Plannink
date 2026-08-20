@@ -53,6 +53,18 @@ Alternatively, the code can be sent as a plain text body.
 | 404 | text | `Bad replay code: replay not found` | Gem worker rejected the code — invalid / nonexistent replay (gem `BadReplayCode`). Also returned for the unknown `/endpoint` case with body `Not found`. |
 | 500 | text | Error message | Generic worker failure (gem `ReplayDownloadFailure`), console not connected, gem worker timeout, or state-machine timeout. The body text distinguishes the case. |
 
+**Response headers (200 only):**
+| Header | Always present | Value |
+|---|---|---|
+| `X-Uploader-Npln` | No | NPLN ID of the account that *recorded* the replay, e.g. `u-apcykoaq5r2xbviomnmm`. Lowercased, so it matches `^u-[a-z0-9]{20}$` as sent. |
+
+The value comes from `NplnReplayWorker::Meta::mUID`, which gem captures during
+the meta phase and puts at the head of the `ReplayResp` body. Plannink strips
+that prefix before writing the response, so **the 200 body is exactly the replay
+file and nothing else** — clients that stream it straight to disk need no
+change. The header is **omitted entirely** when gem had no UID for the replay;
+treat absent as anonymous. Error responses never carry it.
+
 #### Example
 
 ```bash
@@ -69,10 +81,13 @@ curl -X POST http://localhost:5003/replay \
 - The connection stays open until the replay is fully processed.
 - The returned bytes are the raw replay file as the game's replay worker produces it.
 - 404 (`Bad replay code: replay not found`) means the code itself is bad/nonexistent; a 500 means the worker, link, or state machine failed and the code may be worth retrying.
+- The uploader's NPLN rides along with the bytes on `X-Uploader-Npln`, so resolving it needs no second request. There is deliberately no separate uploader-lookup endpoint: answering one would mean a second full `ResolveReplayCode` plus binary download on the console, to reread a field the first call already returned.
 
 ## Gem socket
 
 The gem-injected game on the Switch is a TCP client that connects *out* to Plannink. Plannink listens on `gem.bind:gem.port` (default `0.0.0.0:6388`, also overridable via `PLANNINK_GEM_BIND` / `PLANNINK_GEM_PORT`). Point the console's `sd:/gem/config.txt` `server=`/`port=` at this host.
+
+A successful `ReplayResp` body is `[23-byte recorder NPLN][raw replay bytes]` — a NUL-terminated `char m_RecorderNplnId[23]` (all-NUL if the meta carried no UID), with the replay running to the end of the packet. Plannink splits the two and surfaces the NPLN as the `X-Uploader-Npln` response header on `/replay`. A prefix that is neither empty nor NPLN-shaped is logged as an error: it means the console is running a gem build from before the prefix existed, and the served replay is short by 23 bytes.
 
 Two kinds of upstream notification get forwarded to the main app — both POST with `Authorization: Bearer <pool_ingest.token>` (same token covers both). The token is set in `config.json` under `pool_ingest.token` or via the `PLANNINK_POOL_INGEST_TOKEN` env var; if unset, the corresponding payloads are dropped with a warning. Both forwarders are best-effort and never affect replay serving.
 

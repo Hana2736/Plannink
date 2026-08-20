@@ -672,6 +672,14 @@ class ReplayCodeHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/octet-stream')
                 self.send_header('Content-Length', str(len(replay_data)))
+                # Who recorded it, straight off the ReplayResp prefix. Sent as
+                # a header rather than in the body so the body stays exactly
+                # the replay file — callers that stream it to disk are
+                # unaffected. Omitted entirely when gem had no UID, so a
+                # client can treat "absent" as "anonymous" without parsing.
+                uploader_npln = result_dict.get('uploader_npln')
+                if uploader_npln:
+                    self.send_header('X-Uploader-Npln', uploader_npln)
                 self.end_headers()
                 self.wfile.write(replay_data)
             else:
@@ -1131,7 +1139,8 @@ def _process_single_code(code, result_event, result_dict):
 
     log.info(f"Submitting replay code to gem worker: {code}")
     try:
-        replay_data = gem_server.submit(code, timeout=GEM_SUBMIT_TIMEOUT)
+        uploader_npln, replay_data = gem_server.submit(
+            code, timeout=GEM_SUBMIT_TIMEOUT)
     except GemReplayError as e:
         if e.error_type == ERR_BAD_REPLAY_CODE:
             log.info(f"gem: bad replay code {code}")
@@ -1156,8 +1165,10 @@ def _process_single_code(code, result_event, result_dict):
         result_event.set()
         return 'error_cleanup_done'
 
-    log.info(f"gem: got {len(replay_data)} bytes for {code}")
+    log.info(f"gem: got {len(replay_data)} bytes for {code} "
+             f"(uploader {uploader_npln or 'unknown'})")
     result_dict['replay_data'] = replay_data
+    result_dict['uploader_npln'] = uploader_npln
     result_dict['ok'] = True
     result_event.set()
     return 'ok'

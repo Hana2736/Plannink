@@ -21,7 +21,10 @@ On that single socket, packets are interleaved. Wire format
                                                           connection down.
     ReplayReq(1)                 we send this         -> 17-byte body: 16-char
                                                          code + NUL
-    ReplayResp(2)                success              -> body is raw replay bytes
+    ReplayResp(2)                success              -> body is a 23-byte
+                                                         recorder NPLN prefix
+                                                         followed by the raw
+                                                         replay bytes
     Err(3)                       failure              -> body is u32 ErrorType LE
                                                          (0 BadReplayCode,
                                                           1 ReplayDownloadFailure)
@@ -42,10 +45,16 @@ ReplayResp / Err / timeout has been observed, so callers can safely enqueue
 codes one at a time.
 """
 
+import re
 import socket
 import struct
 import threading
 import time
+
+
+# Shape the recorder NPLN is expected to take, both on ReplayResp and in the
+# notification bodies. Matches what the main app validates against.
+_NPLN_RE = re.compile(r'^u-[a-z0-9]{20}$')
 
 
 # --- Protocol constants ---
@@ -60,6 +69,14 @@ PKT_FRIEND_NOTIFICATION = 5
 REPLAY_CODE_LENGTH = 16
 REPLAY_REQ_BODY_SIZE = REPLAY_CODE_LENGTH + 1  # char m_Code[17]
 NPLN_ID_LENGTH = 22
+
+# ReplayRespHeader (protocol.hpp:53): char m_RecorderNplnId[23] at the head of
+# every ReplayResp body, with the raw replay binary immediately after it — so
+# the replay is (header.m_Size - REPLAY_RESP_HEADER_SIZE) bytes. The value is
+# NplnReplayWorker::Meta::mUID, the account that recorded the replay, which
+# gem captures during the meta phase (main.cpp:100). It is all-NUL when the
+# meta carried no UID.
+REPLAY_RESP_HEADER_SIZE = NPLN_ID_LENGTH + 1
 
 # UploadReplayNotificationBody (protocol.hpp:57): u64 timestamp @0,
 # u64 m_NsaId @8, char m_Sender[23] @16, char m_ReplayCode[17] @39, total
@@ -264,8 +281,12 @@ class GemServer:
                 if ptype == PKT_REPLAY_RESP:
                     if size > _MAX_REPLAY_BYTES:
                         raise ConnectionError(f'absurd ReplayResp size {size}')
+                    if size < REPLAY_RESP_HEADER_SIZE:
+                        raise ConnectionError(
+                            f'ReplayResp too short for its header '
+                            f'({size} < {REPLAY_RESP_HEADER_SIZE})')
                     body = _recv_exact(conn, size)
-                    self._deliver(data=body)
+                    self._deliver(data=self._split_replay_resp(body))
                     continue
 
                 if ptype == PKT_ERR:
@@ -290,6 +311,31 @@ class GemServer:
                     self._log.warning(f"Gem: ignoring unknown packet type {ptype} ({size}B)")
         except (ConnectionError, OSError) as e:
             self._drop_connection(str(e))
+
+    def _split_replay_resp(self, body):
+        """Peel the ReplayRespHeader off a ReplayResp body.
+
+        Returns (recorder_npln, replay_bytes). The NPLN is lowercased for
+        the same reason the pool-ingest payload is: the main app matches it
+        against ^u-[a-z0-9]{20}$. An all-NUL prefix (meta had no UID) yields
+        ''.
+
+        The prefix is always stripped — that is the protocol — but a value
+        that is neither empty nor NPLN-shaped almost certainly means the
+        console is running a gem build from before the prefix existed, in
+        which case we are shaving 23 bytes off the front of a real replay.
+        That corrupts silently, so say so loudly.
+        """
+        raw = body[:REPLAY_RESP_HEADER_SIZE]
+        replay = body[REPLAY_RESP_HEADER_SIZE:]
+        npln = raw.split(b'\x00', 1)[0].decode('ascii', 'ignore').strip().lower()
+        if npln and not _NPLN_RE.match(npln):
+            self._log.error(
+                f"Gem: ReplayResp prefix {npln!r} is not an NPLN id — is the "
+                f"console running a gem build without ReplayRespHeader? "
+                f"The replay is probably now missing its first "
+                f"{REPLAY_RESP_HEADER_SIZE} bytes.")
+        return npln, replay
 
     def _handle_upload_notification(self, body):
         """Console pushed an UploadReplayNotification: decode the replay code
@@ -428,8 +474,10 @@ class GemServer:
     def submit(self, code, timeout):
         """Send `code` to the worker and block until it responds.
 
-        Returns the raw replay bytes. Raises GemReplayError / GemNotConnected
-        / GemTimeout. Strictly one request in flight at a time.
+        Returns (recorder_npln, replay_bytes): the NPLN ID of the account
+        that recorded the replay (lowercase, or '' if gem had no UID for it)
+        and the raw replay file. Raises GemReplayError / GemNotConnected /
+        GemTimeout. Strictly one request in flight at a time.
         """
         code = code.strip().upper()
         if len(code) != REPLAY_CODE_LENGTH:
