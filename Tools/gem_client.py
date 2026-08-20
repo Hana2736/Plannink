@@ -25,9 +25,11 @@ On that single socket, packets are interleaved. Wire format
     Err(3)                       failure              -> body is u32 ErrorType LE
                                                          (0 BadReplayCode,
                                                           1 ReplayDownloadFailure)
-    UploadReplayNotification(4)  replay was uploaded   -> forward the code to
-                                                          the on_replay_code
-                                                          handler (off-thread)
+    UploadReplayNotification(4)  replay was uploaded   -> forward the parsed
+                                                          (code, timestamp, nsa,
+                                                          sender) to the
+                                                          on_replay_code handler
+                                                          (off-thread)
     FriendPlayingNotification(5) friend playing event   -> forward the parsed
                                                           (timestamp, nsa, subtype,
                                                           match_mode, sender) to
@@ -57,18 +59,23 @@ PKT_FRIEND_NOTIFICATION = 5
 
 REPLAY_CODE_LENGTH = 16
 REPLAY_REQ_BODY_SIZE = REPLAY_CODE_LENGTH + 1  # char m_Code[17]
+NPLN_ID_LENGTH = 22
 
 # UploadReplayNotificationBody (protocol.hpp:57): u64 timestamp @0,
 # u64 m_NsaId @8, char m_Sender[23] @16, char m_ReplayCode[17] @39, total
-# 56 bytes. NSA ID and the NPLN ID (sender) are on the wire but Plannink
-# doesn't forward them anywhere — only the code is consumed.
+# 56 bytes. Gem only emits this packet for the *friend* stream — it drops
+# pool-stream uploads, which arrive with m_NsaId == 0 because the server
+# scrubs the id (hooks/spl_notification.cpp:87) — so the NSA ID here is
+# always a real, nonzero sender.
+UPLOAD_NOTIFICATION_TIMESTAMP_OFFSET = 0
+UPLOAD_NOTIFICATION_NSA_ID_OFFSET = 8
+UPLOAD_NOTIFICATION_SENDER_OFFSET = 16
 UPLOAD_NOTIFICATION_CODE_OFFSET = 39
 UPLOAD_NOTIFICATION_BODY_SIZE = 56
 
 # FriendPlayingNotificationBody (protocol.hpp:64): u64 timestamp @0,
 # u64 m_NsaId @8, u8 m_Subtype @16, u32 m_MatchMode @20 (3B pad in between),
 # char m_Sender[23] @24, total 48 bytes.
-NPLN_ID_LENGTH = 22
 FRIEND_NOTIFICATION_BODY_SIZE = 48
 FRIEND_NOTIFICATION_TIMESTAMP_OFFSET = 0
 FRIEND_NOTIFICATION_NSA_ID_OFFSET = 8
@@ -158,9 +165,10 @@ class GemServer:
         self._bind = bind
         self._port = port
         self._log = log
-        # Called with the replay code (str) whenever the console pushes an
-        # UploadReplayNotification. Invoked on a throwaway daemon thread so a
-        # slow handler can never stall the socket reader / heartbeats.
+        # Called with (code:str, timestamp:int, nsa_id:int, sender:str)
+        # whenever the console pushes an UploadReplayNotification. Invoked on
+        # a throwaway daemon thread so a slow handler can never stall the
+        # socket reader / heartbeats.
         self._on_replay_code = on_replay_code
         # Called with (timestamp:int, nsa_id:int, subtype:int, match_mode:int,
         # sender:str) for every FriendPlayingNotification. Same off-thread
@@ -284,8 +292,9 @@ class GemServer:
             self._drop_connection(str(e))
 
     def _handle_upload_notification(self, body):
-        """Console pushed an UploadReplayNotification: pull the replay code
-        out and forward it to the configured handler (off-thread)."""
+        """Console pushed an UploadReplayNotification: decode the replay code
+        plus the sender identity (NSA ID + NPLN ID) and forward them to the
+        configured handler (off-thread)."""
         if self._on_replay_code is None:
             return
         if len(body) < UPLOAD_NOTIFICATION_BODY_SIZE:
@@ -299,9 +308,20 @@ class GemServer:
         if len(code) != REPLAY_CODE_LENGTH:
             self._log.warning(f"Gem: upload notification with bad code {code!r}")
             return
-        self._log.info(f"Gem: upload notification for {code}")
+        timestamp = int.from_bytes(
+            body[UPLOAD_NOTIFICATION_TIMESTAMP_OFFSET:
+                 UPLOAD_NOTIFICATION_TIMESTAMP_OFFSET + 8], 'little')
+        nsa_id = int.from_bytes(
+            body[UPLOAD_NOTIFICATION_NSA_ID_OFFSET:
+                 UPLOAD_NOTIFICATION_NSA_ID_OFFSET + 8], 'little')
+        sender_raw = body[UPLOAD_NOTIFICATION_SENDER_OFFSET:
+                          UPLOAD_NOTIFICATION_SENDER_OFFSET + NPLN_ID_LENGTH + 1]
+        sender = sender_raw.split(b'\x00', 1)[0].decode('ascii', 'ignore')
+        self._log.info(
+            f"Gem: upload notification for {code} "
+            f"nsa={nsa_id:016x} sender={sender}")
         threading.Thread(
-            target=self._on_replay_code, args=(code,),
+            target=self._on_replay_code, args=(code, timestamp, nsa_id, sender),
             name='gem-ingest', daemon=True,
         ).start()
 

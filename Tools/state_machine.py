@@ -53,13 +53,23 @@ CLOUDFETCH_HEALTH_URL = config.get('pool_ingest', {}).get(
     'cloudfetch_health_url',
     'https://hana.lol/inksight/cloudfetch_health')
 POOL_INGEST_TOKEN = config.get('pool_ingest', {}).get('token', '')
+# Shape the pool_ingest_code endpoint enforces on `npln`.
+NPLN_ID_RE = re.compile(r'^u-[a-z0-9]{20}$')
 
 # Health heartbeat: ping the main app every HEALTH_PING_INTERVAL seconds with
 # our current readiness. The main app flags the fetcher "crashed" if it sees
 # no successful ping for >90s, so the interval must stay comfortably under that.
 HEALTH_PING_INTERVAL = 60   # seconds between pings
 HEALTH_PING_TIMEOUT = 5     # per-request timeout
-HEALTH_READY_STATE = 'LobbyVersus_LobbyAtTml'   # parked + serving == ready
+# The title screen is our parked "ready" state. With gem we drive the game's
+# replay worker directly, so the game only needs to be booted this far — we
+# never advance past the title into the lobby. During Splatfest vision may
+# misclassify the title screen as LobbyWandering/FreeRoam, so we accept those
+# labels as the title screen too (since we never move, the game can't
+# legitimately be at either).
+TITLE_READY_STATES = ('BankaraPlaza_TitleScreen',
+                      'LobbyVersus_LobbyWandering',
+                      'BankaraPlaza_FreeRoam')
 # States that suppress the ping entirely. We deliberately go silent (rather
 # than report a state) when the bot can't serve — the main app's >90s timeout
 # then surfaces it as down/crashed, which is the signal we want.
@@ -101,8 +111,15 @@ log = logging.getLogger('StateMachine')
 
 # --- Gem worker bridge ---
 
-def _pool_ingest_code(code):
-    """Forward a freshly-uploaded replay code to the main app.
+def _pool_ingest_code(code, timestamp, nsa_id, sender):
+    """Forward a freshly-uploaded replay code, plus who recorded it, to the
+    main app.
+
+    The endpoint takes exactly two fields: `code` (it accepts the bare
+    16-char form gem_client normalizes to, case/dash-insensitive) and
+    `npln`, the recorder's NPLN ID lowercased to match ^u-[a-z0-9]{20}$.
+    The timestamp and NSA ID also on the wire are not wanted here, so they
+    stay local — only the NSA ID is used, for the log line.
 
     Best-effort: runs on a gem-spawned daemon thread, never raises, and
     never touches the queue or state machine — a failed ingest must not
@@ -111,7 +128,12 @@ def _pool_ingest_code(code):
     if not POOL_INGEST_TOKEN:
         log.warning(f"Pool ingest: no token configured, dropping {code}")
         return
-    payload = json.dumps({'code': code}).encode('utf-8')
+    npln = sender.lower()
+    if not NPLN_ID_RE.match(npln):
+        # Send anyway — the server is the authority on what it accepts, and
+        # silently dropping a real replay code hurts more than a 400 does.
+        log.warning(f"Pool ingest: {code} has malformed npln {npln!r}")
+    payload = json.dumps({'code': code, 'npln': npln}).encode('utf-8')
     req = urllib.request.Request(
         POOL_INGEST_URL, data=payload, method='POST',
         headers={
@@ -121,7 +143,8 @@ def _pool_ingest_code(code):
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            log.info(f"Pool ingest: {code} -> HTTP {resp.status}")
+            log.info(f"Pool ingest: {code} from {npln} "
+                     f"(nsa={nsa_id:016x}) -> HTTP {resp.status}")
     except urllib.error.HTTPError as e:
         log.error(f"Pool ingest: {code} -> HTTP {e.code} {e.reason}")
     except (urllib.error.URLError, OSError) as e:
@@ -178,8 +201,8 @@ def _compute_health_state():
     Returns 'ready', 'loading', or None (send nothing):
       - gem not connected               -> None  (can't serve; looks down)
       - OSErr / SystemWindow / HOMEMenu -> None  (errored / quit; looks down)
-      - parked at the lobby terminal    -> 'ready'
-      - anything else (boot + lobby nav)-> 'loading'
+      - parked at the title screen      -> 'ready'
+      - anything else (boot navigation) -> 'loading'
     """
     if not gem_server.is_connected():
         return None
@@ -189,7 +212,7 @@ def _compute_health_state():
     label = state[0]
     if label in HEALTH_SKIP_LABELS or label.startswith(HEALTH_SKIP_PREFIXES):
         return None
-    if label == HEALTH_READY_STATE:
+    if label in TITLE_READY_STATES:
         return 'ready'
     return 'loading'
 
@@ -993,115 +1016,23 @@ def phase_home_boot():
 
 
 def phase_title_wait():
-    """Phase 2: Wait for title screen, then press ZL+ZR.
-    During Splatfest the AI may misrecognize the title screen as
-    LobbyVersus_LobbyWandering or BankaraPlaza_FreeRoam, so we accept
-    those labels here too. Safe because this phase runs immediately
-    after HOME_BOOT — we can't legitimately be at LobbyWandering or
-    FreeRoam yet."""
+    """Phase 2: Wait for the title screen — our parked "ready" state.
+
+    We do NOT press ZL+ZR or advance any further: with gem we drive the
+    game's replay worker directly, so the game only needs to be booted to
+    the title screen. During Splatfest the AI may misrecognize the title
+    screen as LobbyVersus_LobbyWandering or BankaraPlaza_FreeRoam, so we
+    accept those labels too. Safe because this phase runs immediately after
+    HOME_BOOT and we never move — we can't legitimately be at LobbyWandering
+    or FreeRoam yet.
+    """
     log.info("=== Phase 2: TITLE_WAIT ===")
-    result = wait_for_state(
-        ['BankaraPlaza_TitleScreen',
-         'LobbyVersus_LobbyWandering',
-         'BankaraPlaza_FreeRoam'], 60)
+    result = wait_for_state(list(TITLE_READY_STATES), 60)
     if not result:
         return False
     if result != 'BankaraPlaza_TitleScreen':
         log.info(f"Splatfest title screen detected (misclassified as {result})")
-    time.sleep(5)
-    send_action('ClickZLZR')
     return True
-
-
-def phase_news_or_freeroam():
-    """Phase 3: Handle news screen or direct freeroam."""
-    log.info("=== Phase 3: NEWS_OR_FREEROAM ===")
-
-    # Wait for either news or freeroam
-    result = wait_for_state(['Spl3News', 'BankaraPlaza_FreeRoam'], 60)
-    if not result:
-        return False
-
-    if result == 'BankaraPlaza_FreeRoam':
-        # Skipped news — plan says quit and restart
-        log.info("Got FreeRoam without News, quitting to restart")
-        return False
-
-    # Got news, mash A until freeroam
-    log.info("Got News, mashing A to dismiss")
-    result = wait_for_state('BankaraPlaza_FreeRoam', 300,
-                            poll_action='ClickA', poll_interval=0.1)
-    if not result:
-        return False
-    return True
-
-
-def phase_freeroam_to_lobby():
-    """Phase 4: Open menu from freeroam, get to lobby entry."""
-    log.info("=== Phase 4: FREEROAM_LOBBY ===")
-    deadline = time.time() + 300
-
-    while time.time() < deadline:
-        _check_watchdog()
-        state = read_state()
-        if not state:
-            time.sleep(POLL_INTERVAL)
-            continue
-
-        label = state[0]
-
-        if label == 'BankaraPlaza_FreeRoam':
-            log.info("At FreeRoam, pressing X to open menu")
-            send_action('ClickX')
-            # Wait for menu to appear
-            menu_result = wait_for_state(
-                ['GameMenu_LobbyHighlighted', 'GameMenu_BadSelection'],
-                15
-            )
-            if menu_result == 'GameMenu_LobbyHighlighted':
-                log.info("Lobby highlighted, pressing A")
-                send_action('ClickA')
-                entry = wait_for_state('LobbyVersus_LobbyWandering', 30)
-                if entry:
-                    return True
-                log.warning("Didn't reach LobbyWandering after clicking A")
-                continue
-            elif menu_result == 'GameMenu_BadSelection':
-                log.info("Bad menu selection, pressing B to back out")
-                send_action_repeated('ClickB', 5, 0.5)
-                wait_for_state('BankaraPlaza_FreeRoam', 15)
-                continue
-            else:
-                log.warning("Menu didn't appear, retrying")
-                continue
-
-        time.sleep(POLL_INTERVAL)
-
-    log.warning("Phase FREEROAM_LOBBY timed out")
-    return False
-
-
-def phase_walk_to_tml():
-    """Phase 5: Walk to the terminal in the lobby."""
-    log.info("=== Phase 5: WALK_TO_TML ===")
-    send_action('WalkToLobbyTml')
-
-    result = wait_for_state('LobbyVersus_LobbyAtTml', 30)
-    if result:
-        return True
-
-    # Check if still wandering — walk failed, back out and retry from phase 4
-    state = read_state()
-    if state and state[0] == 'LobbyVersus_LobbyWandering':
-        log.info("Still wandering in lobby, backing out to freeroam")
-        send_action('ClickX')
-        time.sleep(1)
-        send_action('ClickA')
-        wait_for_state('BankaraPlaza_FreeRoam', 30)
-        return None  # Signal to retry from phase 4
-
-    log.warning("Walk to TML failed unexpectedly")
-    return False
 
 
 def process_code_queue():
@@ -1130,8 +1061,8 @@ def process_code_queue():
             except queue.Empty:
                 # Verify we're still at code box while idling
                 state = read_state()
-                if state and state[0] != 'LobbyVersus_LobbyAtTml':
-                    log.warning(f"Lost lobby terminal while idling (now: {state[0]})")
+                if state and state[0] not in TITLE_READY_STATES:
+                    log.warning(f"Lost title screen while idling (now: {state[0]})")
                     return False
                 # A gem socket we'd established dropping out from under us
                 # almost always means the game crashed (gem aborts the
@@ -1184,9 +1115,9 @@ def _process_single_code(code, result_event, result_dict):
 
     No typing, no in-game menu navigation, no FTP: gem drives the game's
     own replay worker on the Switch and streams the bytes straight back.
-    We only sanity-check that the bot is still parked at the lobby terminal
-    (a stable, online, in-lobby state where the replay worker is live) and
-    then submit. The gem client serializes so only one code is ever in flight.
+    We only sanity-check that the bot is still parked at the title screen
+    (a stable, online state where the replay worker is live) and then
+    submit. The gem client serializes so only one code is ever in flight.
 
     Returns 'ok' on success or 'error_cleanup_done' on a clean failure
     (game is fine, just report it). Returns None only if the state was
@@ -1194,8 +1125,8 @@ def _process_single_code(code, result_event, result_dict):
     notified via result_event before we return.
     """
     state = read_state()
-    if not state or state[0] != 'LobbyVersus_LobbyAtTml':
-        log.warning(f"Not at lobby terminal (at: {state[0] if state else 'None'})")
+    if not state or state[0] not in TITLE_READY_STATES:
+        log.warning(f"Not at title screen (at: {state[0] if state else 'None'})")
         return None
 
     log.info(f"Submitting replay code to gem worker: {code}")
@@ -1370,34 +1301,12 @@ def run_state_machine():
                 quit_game_and_wait()
                 continue
 
-            # Phase 3: NEWS_OR_FREEROAM
-            if not phase_news_or_freeroam():
-                quit_game_and_wait()
-                continue
-
-            # Phase 4+5: FREEROAM → LOBBY → WALK TO TML
-            while True:
-                result4 = phase_freeroam_to_lobby()
-                if not result4:
-                    break  # quit and restart
-
-                result5 = phase_walk_to_tml()
-                if result5 is True:
-                    break  # success
-                elif result5 is None:
-                    continue  # retry from phase 4
-                else:
-                    break  # quit and restart
-
-            if result5 is not True:
-                quit_game_and_wait()
-                continue
-
-            # SUCCESS — standing at the lobby terminal (LobbyVersus_LobbyAtTml).
-            # With gem we drive the game's replay worker directly, so there's
-            # no reason to open the terminal menu or walk to the code box: the
-            # terminal is the parked "ready" state. We serve API codes from here.
-            log.info("=== AT LOBBY TERMINAL — READY FOR CODES ===")
+            # SUCCESS — parked at the title screen. With gem we drive the
+            # game's replay worker directly, so the game only needs to be
+            # booted this far: there's no reason to press ZL+ZR or navigate
+            # into the lobby. The title screen is the parked "ready" state,
+            # and we serve API codes from here.
+            log.info("=== AT TITLE SCREEN — READY FOR CODES ===")
 
             # process_code_queue parks until it loses the state (returns False)
             # or detects a crash (raises QuitAndRestart). Either way we fall

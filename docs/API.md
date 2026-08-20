@@ -76,7 +76,14 @@ The gem-injected game on the Switch is a TCP client that connects *out* to Plann
 
 Two kinds of upstream notification get forwarded to the main app — both POST with `Authorization: Bearer <pool_ingest.token>` (same token covers both). The token is set in `config.json` under `pool_ingest.token` or via the `PLANNINK_POOL_INGEST_TOKEN` env var; if unset, the corresponding payloads are dropped with a warning. Both forwarders are best-effort and never affect replay serving.
 
-- **`UploadReplayNotification`** → POST `pool_ingest.url` (default `https://hana.lol/inksight/pool_ingest_code`) with body `{"code": "R..."}`. The NSA ID and NPLN ID present in the wire packet are *not* forwarded on this endpoint.
+- **`UploadReplayNotification`** → POST `pool_ingest.url` (default `https://hana.lol/inksight/pool_ingest_code`) with body:
+  ```json
+  {
+    "code": "RQ22FYSN00000000",
+    "npln": "u-apcykoaq5r2xbviomnmm"
+  }
+  ```
+  `npln` is the **recorder's** NPLN ID, lowercased to match the `^u-[a-z0-9]{20}$` the endpoint enforces; `code` is sent in the bare 16-char uppercase form (the endpoint is case- and dash-insensitive, so the 19-char hyphenated form is equally valid). The timestamp and NSA ID also present in the wire packet are *not* forwarded — the NSA ID is only used locally, in the log line. Gem emits this packet for the friend stream only: pool-stream uploads arrive with a scrubbed (zero) NSA ID and are dropped console-side.
 - **`FriendPlayingNotification`** → POST `pool_ingest.player_playing_update_url` (default `https://hana.lol/inksight/player_playing_update`) with body:
   ```json
   {
