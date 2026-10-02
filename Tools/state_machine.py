@@ -195,8 +195,7 @@ def _player_x_powers(timestamp, npln, powers):
     `timestamp` is the lobby message's own, passed through as-is. `powers`
     is four floats in X_POWER_RULES order. A rule the player has no
     power in arrives as 0.0 and goes upstream as null, so it can't be mistaken
-    for a real power. The rest are rounded to 2 places — they are float32 in
-    the game, so anything past that is conversion noise.
+    for a real power. The rest are truncated (not rounded) to 2 places.
 
     Best-effort: runs on a gem-spawned daemon thread, never raises, and
     never touches the queue or state machine.
@@ -208,7 +207,7 @@ def _player_x_powers(timestamp, npln, powers):
     if not NPLN_ID_RE.match(npln):
         # Send anyway — the server is the authority on what it accepts.
         log.warning(f"Player X powers: malformed npln {npln!r}")
-    x_powers = {rule: (round(power, 2) if power else None)
+    x_powers = {rule: (int(power * 100) / 100 if power else None)
                 for rule, power in zip(X_POWER_RULES, powers)}
     payload = json.dumps({
         'timestamp': timestamp,
