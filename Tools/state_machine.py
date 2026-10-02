@@ -16,7 +16,7 @@ from pathlib import Path
 from config_loader import load_config
 from gem_client import (
     GemServer, GemNotConnected, GemTimeout, GemReplayError,
-    ERR_BAD_REPLAY_CODE, FRIEND_SUBTYPE_NAMES,
+    ERR_BAD_REPLAY_CODE, FRIEND_SUBTYPE_NAMES, X_POWER_RULES,
 )
 
 # --- Config ---
@@ -43,12 +43,16 @@ GEM_SUBMIT_TIMEOUT = int(config.get('gem', {}).get('submit_timeout', 90))
 
 # Pool ingest: when the console reports a freshly uploaded replay, push the
 # code up to the main app. Token can also come from PLANNINK_POOL_INGEST_TOKEN.
-# The same token covers both pool_ingest_code and player_playing_update.
+# The same token covers pool_ingest_code, player_playing_update and
+# player_x_powers.
 POOL_INGEST_URL = config.get('pool_ingest', {}).get(
     'url', 'https://hana.lol/inksight/pool_ingest_code')
 PLAYER_PLAYING_UPDATE_URL = config.get('pool_ingest', {}).get(
     'player_playing_update_url',
     'https://hana.lol/inksight/player_playing_update')
+PLAYER_X_POWERS_URL = config.get('pool_ingest', {}).get(
+    'player_x_powers_url',
+    'https://hana.lol/inksight/player_x_powers')
 CLOUDFETCH_HEALTH_URL = config.get('pool_ingest', {}).get(
     'cloudfetch_health_url',
     'https://hana.lol/inksight/cloudfetch_health')
@@ -185,11 +189,55 @@ def _player_playing_update(timestamp, nsa_id, subtype, match_mode, sender):
         log.error(f"Player playing update: {sender} failed: {e}")
 
 
+def _player_x_powers(timestamp, npln, powers):
+    """Forward a player's X Powers to the main app.
+
+    `timestamp` is the lobby message's own, passed through as-is. `powers`
+    is four floats in X_POWER_RULES order. A rule the player has no
+    power in arrives as 0.0 and goes upstream as null, so it can't be mistaken
+    for a real power. The rest are rounded to 2 places — they are float32 in
+    the game, so anything past that is conversion noise.
+
+    Best-effort: runs on a gem-spawned daemon thread, never raises, and
+    never touches the queue or state machine.
+    """
+    if not POOL_INGEST_TOKEN:
+        log.warning(f"Player X powers: no token configured, dropping {npln}")
+        return
+    npln = npln.lower()
+    if not NPLN_ID_RE.match(npln):
+        # Send anyway — the server is the authority on what it accepts.
+        log.warning(f"Player X powers: malformed npln {npln!r}")
+    x_powers = {rule: (round(power, 2) if power else None)
+                for rule, power in zip(X_POWER_RULES, powers)}
+    payload = json.dumps({
+        'timestamp': timestamp,
+        'npln':      npln,
+        'x_powers':  x_powers,
+    }).encode('utf-8')
+    req = urllib.request.Request(
+        PLAYER_X_POWERS_URL, data=payload, method='POST',
+        headers={
+            'Authorization': f'Bearer {POOL_INGEST_TOKEN}',
+            'Content-Type': 'application/json',
+        },
+    )
+    summary = ' '.join(f'{rule}={power}' for rule, power in x_powers.items())
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            log.info(f"Player X powers: {npln} {summary} -> HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        log.error(f"Player X powers: {npln} -> HTTP {e.code} {e.reason}")
+    except (urllib.error.URLError, OSError) as e:
+        log.error(f"Player X powers: {npln} failed: {e}")
+
+
 # We are the server; the console (gem-injected game) connects out to us.
 gem_server = GemServer(
     GEM_BIND, GEM_PORT, log,
     on_replay_code=_pool_ingest_code,
     on_friend_playing=_player_playing_update,
+    on_x_powers=_player_x_powers,
 )
 
 

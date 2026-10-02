@@ -89,7 +89,7 @@ The gem-injected game on the Switch is a TCP client that connects *out* to Plann
 
 A successful `ReplayResp` body is `[23-byte recorder NPLN][raw replay bytes]` — a NUL-terminated `char m_RecorderNplnId[23]` (all-NUL if the meta carried no UID), with the replay running to the end of the packet. Plannink splits the two and surfaces the NPLN as the `X-Uploader-Npln` response header on `/replay`. A prefix that is neither empty nor NPLN-shaped is logged as an error: it means the console is running a gem build from before the prefix existed, and the served replay is short by 23 bytes.
 
-Two kinds of upstream notification get forwarded to the main app — both POST with `Authorization: Bearer <pool_ingest.token>` (same token covers both). The token is set in `config.json` under `pool_ingest.token` or via the `PLANNINK_POOL_INGEST_TOKEN` env var; if unset, the corresponding payloads are dropped with a warning. Both forwarders are best-effort and never affect replay serving.
+Three kinds of upstream notification get forwarded to the main app — all POST with `Authorization: Bearer <pool_ingest.token>` (same token covers all three). The token is set in `config.json` under `pool_ingest.token` or via the `PLANNINK_POOL_INGEST_TOKEN` env var; if unset, the corresponding payloads are dropped with a warning. All forwarders are best-effort and never affect replay serving.
 
 - **`UploadReplayNotification`** → POST `pool_ingest.url` (default `https://hana.lol/inksight/pool_ingest_code`) with body:
   ```json
@@ -110,6 +110,20 @@ Two kinds of upstream notification get forwarded to the main app — both POST w
   }
   ```
   `subtype` is one of `StartSolo` / `CreateRoom` / `JoinRoom`; `nsa_id` is the sender's NSA ID as a 16-char zero-padded lowercase hex string; `sender` is the NPLN ID.
+- **`PlayerXPowers`** → POST `pool_ingest.player_x_powers_url` (default `https://hana.lol/inksight/player_x_powers`) with body:
+  ```json
+  {
+    "timestamp": 1748390000,
+    "npln": "u-apcykoaq5r2xbviomnmm",
+    "x_powers": {
+      "splat_zones":   2223.11,
+      "rainmaker":     2334.22,
+      "tower_control": null,
+      "clam_blitz":    2159.98
+    }
+  }
+  ```
+  `timestamp` is the timestamp of the lobby message the powers were read from (unix seconds, the same clock as `player_playing_update`'s). `npln` is the player's NPLN ID, lowercased. All four rule keys are always present; a rule the player has no power in this season is `null`, and at least one is always a number (gem does not send the packet for a player with none). Values are rounded to 2 decimal places. The wire packet is a 48-byte body: `u64 m_Timestamp` at offset 0, `char m_NplnId[23]` at offset 8 and `float m_XPower[4]` at offset 32, in the order Zones, Rainmaker, Tower, Clams. Gem sends it for every lobby message it sees from a player with a power — friend and pool stream alike, whatever the event — so the same player is re-posted, usually with unchanged values, each time they show up; the endpoint should treat it as an upsert. A packet whose powers are negative or non-finite is dropped with a warning rather than forwarded (it means gem's offsets are wrong for the running game version).
 
 ## Health heartbeat
 

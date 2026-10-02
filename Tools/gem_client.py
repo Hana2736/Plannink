@@ -37,6 +37,9 @@ On that single socket, packets are interleaved. Wire format
                                                           (timestamp, nsa, subtype,
                                                           match_mode, sender) to
                                                           on_friend_playing (off-thread)
+    PlayerXPowers(6)             a player's X Powers    -> forward the parsed
+                                                          (timestamp, npln, powers) to
+                                                          on_x_powers (off-thread)
 
 Concurrency: gem refuses more than one replay at a time — sending a second
 ReplayReq while it is still working *crashes the game*. submit() therefore
@@ -45,6 +48,7 @@ ReplayResp / Err / timeout has been observed, so callers can safely enqueue
 codes one at a time.
 """
 
+import math
 import re
 import socket
 import struct
@@ -65,6 +69,7 @@ PKT_REPLAY_RESP = 2
 PKT_ERR = 3
 PKT_UPLOAD_NOTIFICATION = 4
 PKT_FRIEND_NOTIFICATION = 5
+PKT_PLAYER_X_POWERS = 6
 
 REPLAY_CODE_LENGTH = 16
 REPLAY_REQ_BODY_SIZE = REPLAY_CODE_LENGTH + 1  # char m_Code[17]
@@ -110,6 +115,22 @@ FRIEND_SUBTYPE_NAMES = {
     FRIEND_SUBTYPE_CREATE_ROOM: 'CreateRoom',
     FRIEND_SUBTYPE_JOIN_ROOM: 'JoinRoom',
 }
+
+# PlayerXPowersBody (protocol.hpp): u64 m_Timestamp @0, char m_NplnId[23] @8,
+# f32 m_XPower[4] @32 (1B pad in between), total 48 bytes. The timestamp is the
+# lobby message's own (unix seconds), the same value the notification bodies
+# carry. Gem reads the powers off the UserSetting at
+# the head of every lobby message — friend and pool stream alike, whatever the
+# event type — and sends the packet whenever at least one power is nonzero, so
+# the same player is repeated every time they show up. A power of 0.0 means
+# the player has none in that rule this season.
+X_POWERS_BODY_SIZE = 48
+X_POWERS_TIMESTAMP_OFFSET = 0
+X_POWERS_NPLN_OFFSET = 8
+X_POWERS_POWERS_OFFSET = 32
+
+# XPowerRule (protocol.hpp): index into m_XPower, in the game's own order.
+X_POWER_RULES = ('splat_zones', 'rainmaker', 'tower_control', 'clam_blitz')
 
 # Heartbeat keepalive: outbound thread per connection sends Heartbeat,
 # waits for the echo, then sleeps. Gem's response is essentially instant
@@ -178,7 +199,8 @@ class GemServer:
     """Owns the listening socket, the (single) console connection, and the
     request/response handshake."""
 
-    def __init__(self, bind, port, log, on_replay_code=None, on_friend_playing=None):
+    def __init__(self, bind, port, log, on_replay_code=None, on_friend_playing=None,
+                 on_x_powers=None):
         self._bind = bind
         self._port = port
         self._log = log
@@ -191,6 +213,10 @@ class GemServer:
         # sender:str) for every FriendPlayingNotification. Same off-thread
         # semantics as the replay callback.
         self._on_friend_playing = on_friend_playing
+        # Called with (timestamp:int, npln:str, powers:tuple of 4 floats in
+        # X_POWER_RULES order) for every PlayerXPowers packet. Same off-thread
+        # semantics.
+        self._on_x_powers = on_x_powers
 
         self._conn = None            # active console socket, or None
         self._send_lock = threading.Lock()   # serialize writes to the socket
@@ -307,6 +333,8 @@ class GemServer:
                     self._handle_upload_notification(body)
                 elif ptype == PKT_FRIEND_NOTIFICATION:
                     self._handle_friend_notification(body)
+                elif ptype == PKT_PLAYER_X_POWERS:
+                    self._handle_x_powers(body)
                 else:
                     self._log.warning(f"Gem: ignoring unknown packet type {ptype} ({size}B)")
         except (ConnectionError, OSError) as e:
@@ -402,6 +430,36 @@ class GemServer:
             target=self._on_friend_playing,
             args=(timestamp, nsa_id, subtype, match_mode, sender),
             name='gem-playing', daemon=True,
+        ).start()
+
+    def _handle_x_powers(self, body):
+        """Console pushed a PlayerXPowers packet: decode the timestamp, the
+        player's NPLN ID and their four X Powers and forward them to the
+        configured handler (off-thread)."""
+        if self._on_x_powers is None:
+            return
+        if len(body) < X_POWERS_BODY_SIZE:
+            self._log.warning(
+                f"Gem: X powers body too short "
+                f"({len(body)} < {X_POWERS_BODY_SIZE}); ignoring")
+            return
+        timestamp = int.from_bytes(
+            body[X_POWERS_TIMESTAMP_OFFSET:
+                 X_POWERS_TIMESTAMP_OFFSET + 8], 'little')
+        npln_raw = body[X_POWERS_NPLN_OFFSET:
+                        X_POWERS_NPLN_OFFSET + NPLN_ID_LENGTH + 1]
+        npln = npln_raw.split(b'\x00', 1)[0].decode('ascii', 'ignore')
+        powers = struct.unpack_from(
+            f'<{len(X_POWER_RULES)}f', body, X_POWERS_POWERS_OFFSET)
+        # These are raw floats out of game memory. A negative or non-finite
+        # one means gem's offset is off (wrong game version), not that the
+        # player has a strange power — don't pass garbage upstream.
+        if not all(math.isfinite(p) and p >= 0 for p in powers):
+            self._log.warning(f"Gem: X powers for {npln!r} look invalid {powers}; ignoring")
+            return
+        threading.Thread(
+            target=self._on_x_powers, args=(timestamp, npln, powers),
+            name='gem-xpowers', daemon=True,
         ).start()
 
     def _heartbeat_loop(self, conn):
